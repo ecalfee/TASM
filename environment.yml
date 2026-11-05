@@ -19,9 +19,7 @@ dependencies:
   - scipy==1.7
   - tqdm==4.62.2
   - typing-extensions==4.0
-  - wandb
   - modelcif==0.7
-  - awscli
   - ml-collections
   - aria2
   - mkl=2024.0

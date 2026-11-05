@@ -12,11 +12,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by Adaptive Biotechnologies
 
 """Functions for parsing various file formats."""
 import collections
 import dataclasses
 import itertools
+import pandas as pd
 import re
 import string
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Set
@@ -197,6 +199,65 @@ def parse_a3m(a3m_string: str) -> Msa:
         descriptions=descriptions
     )
 
+def make_fasta3_from_cache(data: Dict, out_path):
+    """Make a 3-piece fasta file from a data cache entry.
+        Assume the order of seqs in the data cache is alpha, beta, peptide, mhc.
+    """
+    seq_names = data["fasta_chain_ids"]
+    seqs = data['seqs']
+    fasta = f">{seq_names[0]}\n{seqs[0]}\n"
+    fasta += f">{seq_names[1]}\n{seqs[1]}\n"
+    fasta += (
+        f">{seq_names[2]}z{seq_names[3]}\n"
+        f"{seqs[2]}:{seqs[3]}"
+    )
+    with open(out_path, "w+") as f:
+        f.write(fasta)
+
+def make_fasta4_from_cache(data: Dict, out_path):
+    """Make a 4-piece fasta file from a data cache entry.
+        Assume the order of seqs in the data cache is alpha, beta, peptide, mhc.
+    """
+    seq_names = data["fasta_chain_ids"]
+    seqs = data['seqs']
+    fasta = f">{seq_names[0]}\n{seqs[0]}\n"
+    fasta += f">{seq_names[1]}\n{seqs[1]}\n"
+    fasta += f">{seq_names[2]}\n{seqs[2]}\n"
+    fasta += f">{seq_names[3]}\n{seqs[3]}"
+    with open(out_path, "w+") as f:
+        f.write(fasta)
+
+def convert_fasta3_to_fasta4(fasta_path, out_path):
+    """Convert 3-piece fasta to 4-piece fasta. 
+    [alpha,beta,pmhc] --> [alpha,beta,peptide,mhc]
+
+    Args:
+        fasta_path (str): path to 3-piece fasta.
+            pmhc tag must be separated by "z" and pmhc seq by ":"
+        out_path(str): output path for 4-piece fasta
+    Returns:
+        None
+    """
+    with open(fasta_path) as f:
+        input_fasta_str = f.read()
+    seqs, tags = parse_fasta(input_fasta_str)
+
+    new_tags, new_seqs, = [], []
+    for t, s in zip(tags, seqs):
+        if ":" in s:
+            t1, t2 = t.split("z", 1)
+            s1, s2 = s.split(":")
+            new_tags.extend([t1, t2])
+            new_seqs.extend([s1, s2])
+        else:
+            new_tags.append(t)
+            new_seqs.append(s)
+
+    with open(out_path, "w") as fp:
+        fp.write(
+           '\n'.join([f">{tag}\n{seq}" for tag, seq in zip(new_tags, new_seqs)])
+        )
+
 
 def _convert_sto_seq_to_a3m(
     query_non_gaps: Sequence[bool], sto_seq: str
@@ -311,6 +372,34 @@ def truncate_stockholm_msa(stockholm_msa_path: str, max_sequences: int) -> str:
         filtered_lines.append(line)
 
   return ''.join(filtered_lines)
+
+
+def truncate_stockholm_msa2(stockholm_msa: str, max_sequences: int) -> str:
+    """Truncates a Stockholm alignment. Same as truncate_stockholm_msa,
+    except the input is a Stockholm MSA string, not a path to .sto file.
+    Args:
+        stockholm_msa (str): Stockholm MSA string (e.g. output of truncate_stockholm_msa)
+        max_sequence (int): max number of sequences to return
+    Returns:
+        truncated MSA string containing first k=max_sequences sequences
+    """
+    seqnames = set()
+    filtered_lines = []
+
+    for line in stockholm_msa.splitlines():
+        if line.strip() and not line.startswith(("#", "//")):
+            # Ignore blank lines, markup and end symbols - remainder are alignment
+            # sequence parts.
+            seqname = line.partition(" ")[0]
+            seqnames.add(seqname)
+            if len(seqnames) >= max_sequences:
+                break
+
+    for line in stockholm_msa.splitlines():
+        if _keep_line(line, seqnames):
+            filtered_lines.append(line)
+
+    return "\n".join(filtered_lines) + "\n"
 
 
 def remove_empty_columns_from_stockholm_msa(stockholm_msa: str) -> str:

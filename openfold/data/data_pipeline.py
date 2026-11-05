@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by Adaptive Biotechnologies
 
 import os
 import copy
@@ -20,11 +21,16 @@ import contextlib
 import dataclasses
 from multiprocessing import cpu_count
 import tempfile
-from typing import Mapping, Optional, Sequence, Any, MutableMapping, Union
+from typing import Mapping, Optional, Sequence, Any, MutableMapping, Union, Dict
 import numpy as np
+import pandas as pd
 import torch
-from openfold.data import templates, parsers, mmcif_parsing, msa_identifiers, msa_pairing, feature_processing_multimer
+from openfold.data import templates, parsers, mmcif_parsing, msa_identifiers, msa_pairing, feature_processing_multimer, pmhc_templates
 from openfold.data.templates import get_custom_template_features, empty_template_feats
+from openfold.data.custom_templates import (
+    create_single_template_features,
+    compile_template_features,
+)
 from openfold.data.tools import jackhmmer, hhblits, hhsearch, hmmsearch
 from openfold.np import residue_constants, protein
 
@@ -48,6 +54,53 @@ def make_template_features(
         template_features = templates_result.features
 
     return template_features
+
+
+def make_template_features_for_pmhc(alignment_dir, input_sequence, template_pdb_dir=None):
+    """Make template features for pMHC from a custom alignment file.
+    Code adapted from TCRmodel2 (https://github.com/piercelab/tcrmodel2).
+    Args:
+        alignment_dir (str)
+        input_sequence (str)
+        template_pdb_dir (str, optional): Directory containing pMHC PDB
+            template files. When provided, PDB filenames from the alignment
+            TSV are resolved relative to this directory. When *None*, the
+            raw path from the TSV is used as-is (legacy behaviour).
+    Returns:
+        Dictionary containing template features
+    """
+    pmhc_alignment_file = os.path.join(alignment_dir, "pmhc_alignment.tsv")
+    data = pd.read_table(pmhc_alignment_file)
+
+    template_features_list = []
+    for tnum, row in data.iterrows():
+        target_to_template_alignment = {
+            int(x.split(":")[0]): int(x.split(":")[1])  # 0-indexed
+            for x in row.target_to_template_alignstring.split(";")
+        }
+
+        template_name = os.path.basename(row.template_pdbfile).split(".")[0]
+        if template_pdb_dir is not None:
+            template_pdbfile = os.path.join(
+                template_pdb_dir, "pdb", os.path.basename(row.template_pdbfile)
+            )
+        else:
+            template_pdbfile = row.template_pdbfile
+        template_features = create_single_template_features(
+            input_sequence,
+            template_pdbfile,
+            target_to_template_alignment,
+            template_name,
+            allow_chainbreaks=True,
+            allow_skipped_lines=True,
+            expected_identities=None,
+            expected_template_len=row.template_len,
+        )
+        template_features_list.append(template_features)
+
+    template_search_result = compile_template_features(template_features_list)
+
+    return template_search_result.features
 
 
 def unify_template_features(
@@ -115,6 +168,28 @@ def make_sequence_features(
         [sequence.encode("utf-8")], dtype=object
     )
     return features
+
+
+def update_residue_index(input_sequence, sequence_features):
+    """Add a big number to residue index to indicate chain breaks
+    Adapted from Minkyung's code. 
+    Args:
+        input_sequence (str)
+        sequence_features (dict)
+    Returns:
+        updated sequence features (dict)
+    """
+    idx_res = sequence_features['residue_index']
+    Ls = [len(seq) for seq in input_sequence.split(":")]
+    L_prev = 0
+    # Ls: number of residues in each chain
+    for L_i in Ls[:-1]:
+        idx_res[L_prev + L_i:] += 200
+        L_prev += L_i
+
+    sequence_features['residue_index'] = idx_res
+
+    return sequence_features
 
 
 def make_mmcif_features(
@@ -268,6 +343,58 @@ def run_msa_tool(
     return result
 
 
+def run_pmhc_alignment(
+    fasta_path,
+    pmhc_templates_dir,
+    alignment_out_path,
+    use_pmhc_template_filter
+):
+    """Run pMHC template alignment if the input sequence contains ":".
+
+    Args:
+        fasta_path (str): path to fasta file containing pMHC as pep:mhc
+        pmhc_templates_dir (str): path to pMHC template directory
+        alignment_out_path (str): output path
+        use_pmhc_template_filter (bool): whether to filter out pmhc templates whose
+            peptide seqs are too similar to the query peptide. When pmhc_seq string
+            contains 2 :-delimited tokens, it filters out class I templates whose
+            peptide is within 2-Levenshtein distance. When pmhc_seq string contains
+            3 :-delimited tokens, it filters out class II templates whose peptide
+            (always length 9 in our template database) is contained within the fed
+            peptide (which must be at least length 9, otherwise a ValueError is thrown).
+    Returns:
+        None
+    """
+    with open(fasta_path, 'r') as f:
+        fasta_str = f.read()
+    input_seqs, _ = parsers.parse_fasta(fasta_str)
+    input_seq = input_seqs[0]
+
+    seq_list = input_seq.split(":")
+    if len(seq_list) == 2:
+        # Class I
+        pmhc_templates.gen_align_file_cls1(
+            pep_seq=seq_list[0],
+            mhc_seq=seq_list[1],
+            out_path=alignment_out_path,
+            pmhc_templates_dir=pmhc_templates_dir,
+            ignore_pdbs=[],
+            use_pmhc_template_filter=use_pmhc_template_filter,
+        )
+    else:
+        # Class II
+        assert len(seq_list) == 3
+        pmhc_templates.gen_align_file_cls2(
+            pep_seq=seq_list[0],
+            mhc1_seq=seq_list[1],
+            mhc2_seq=seq_list[2],
+            out_path=alignment_out_path,
+            pmhc_templates_dir=pmhc_templates_dir,
+            ignore_pdbs=[],
+            use_pmhc_template_filter=use_pmhc_template_filter,
+        )
+
+ 
 def make_dummy_msa_obj(input_sequence) -> parsers.Msa:
     deletion_matrix = [[0 for _ in input_sequence]]
     return parsers.Msa(sequences=[input_sequence],
@@ -330,12 +457,14 @@ class AlignmentRunner:
         uniref30_database_path: Optional[str] = None,
         uniclust30_database_path: Optional[str] = None,
         uniprot_database_path: Optional[str] = None,
+        pmhc_templates_dir: Optional[str] = None,
         template_searcher: Optional[TemplateSearcher] = None,
         use_small_bfd: Optional[bool] = None,
         no_cpus: Optional[int] = None,
         uniref_max_hits: int = 10000,
         mgnify_max_hits: int = 5000,
         uniprot_max_hits: int = 50000,
+        use_pmhc_template_filter: bool = False,
     ):
         """
         Args:
@@ -359,6 +488,8 @@ class AlignmentRunner:
             uniclust30_database_path:
                 Path to uniclust30. Searched alongside BFD if use_small_bfd is
                 false.
+            pmhc_templates_dir:
+                Directory containing nr_cls_I_complexes.txt and pdb/
             use_small_bfd:
                 Whether to search the BFD database alone with jackhmmer or
                 in conjunction with uniref30/uniclust30 with hhblits.
@@ -371,6 +502,9 @@ class AlignmentRunner:
                 Max number of mgnify hits
             uniprot_max_hits:
                 Max number of uniprot hits
+            use_pmhc_template_filter:
+                Whether to filter out pmhc templates whose peptide seqs are too
+                similar to query peptide
         """
         db_map = {
             "jackhmmer": {
@@ -401,6 +535,8 @@ class AlignmentRunner:
         self.mgnify_max_hits = mgnify_max_hits
         self.uniprot_max_hits = uniprot_max_hits
         self.use_small_bfd = use_small_bfd
+        self.pmhc_templates_dir = pmhc_templates_dir
+        self.use_pmhc_template_filter = use_pmhc_template_filter
 
         if(no_cpus is None):
             no_cpus = cpu_count()
@@ -465,8 +601,27 @@ class AlignmentRunner:
         self,
         fasta_path: str,
         output_dir: str,
+        query_seq: str
     ):
         """Runs alignment tools on a sequence"""
+        if (":" in query_seq):  # custom alignment for pmhc
+            if (
+                self.pmhc_templates_dir is not None
+                and os.path.exists(self.pmhc_templates_dir)
+            ):
+                pmhc_out_path = os.path.join(output_dir, "pmhc_alignment.tsv")
+                run_pmhc_alignment(
+                    fasta_path=fasta_path,
+                    pmhc_templates_dir=self.pmhc_templates_dir,
+                    alignment_out_path=pmhc_out_path,
+                    use_pmhc_template_filter=self.use_pmhc_template_filter,
+                )
+                return
+            else:
+                raise IOError(
+                    "Valid pmhc_templates_dir required to align pMHC sequence."
+                )
+
         if(self.jackhmmer_uniref90_runner is not None):
             uniref90_out_path = os.path.join(output_dir, "uniref90_hits.sto")
 
@@ -483,6 +638,8 @@ class AlignmentRunner:
             template_msa = parsers.remove_empty_columns_from_stockholm_msa(
                 template_msa
             )
+            # keep the input sequence only for template search (input seq = first seq in msa)
+            template_msa = parsers.truncate_stockholm_msa2(template_msa, 1)
 
             if(self.template_searcher is not None):
                 if(self.template_searcher.input_format == "sto"):
@@ -695,8 +852,10 @@ class DataPipeline:
     def __init__(
         self,
         template_featurizer: Optional[templates.TemplateHitFeaturizer],
+        pmhc_templates_dir: Optional[str] = None,
     ):
         self.template_featurizer = template_featurizer
+        self.pmhc_templates_dir = pmhc_templates_dir
 
     def _parse_msa_data(
         self,
@@ -854,6 +1013,7 @@ class DataPipeline:
         alignment_dir: str,
         alignment_index: Optional[Any] = None,
         seqemb_mode: bool = False,
+        template_names_out_path: Optional[str] = None,
     ) -> FeatureDict:
         """Assembles features for a single sequence in a FASTA file"""
         with open(fasta_path) as f:
@@ -863,27 +1023,45 @@ class DataPipeline:
             raise ValueError(
                 f"More than one input sequence found in {fasta_path}."
             )
-        input_sequence = input_seqs[0]
+        is_pmhc = False
+        if ":" in input_seqs[0]:
+            input_sequence = "".join(input_seqs[0].split(":"))
+            is_pmhc = True
+        else:
+            input_sequence = input_seqs[0]
         input_description = input_descs[0]
         num_res = len(input_sequence)
 
-        hits = self._parse_template_hit_files(
-            alignment_dir=alignment_dir,
-            input_sequence=input_sequence,
-            alignment_index=alignment_index,
-        )
+        # Do custom template featurization for pMHC
+        if is_pmhc:
+            template_features = make_template_features_for_pmhc(
+                alignment_dir, input_sequence,
+                template_pdb_dir=self.pmhc_templates_dir,
+            )
+        else:
+            hits = self._parse_template_hit_files(
+                alignment_dir=alignment_dir,
+                input_sequence=input_sequence,
+                alignment_index=alignment_index,
+            )
 
-        template_features = make_template_features(
-            input_sequence,
-            hits,
-            self.template_featurizer,
-        )
+            template_features = make_template_features(
+                input_sequence,
+                hits,
+                self.template_featurizer,
+            )
 
         sequence_features = make_sequence_features(
             sequence=input_sequence,
             description=input_description,
             num_res=num_res,
         )
+
+        if is_pmhc:
+            sequence_features = update_residue_index(
+                input_seqs[0],
+                sequence_features
+            )
 
         sequence_embedding_features = {}
         # If using seqemb mode, generate a dummy MSA features using just the sequence
@@ -892,7 +1070,15 @@ class DataPipeline:
             sequence_embedding_features = self._process_seqemb_features(alignment_dir)
         else:
             msa_features = self._process_msa_feats(alignment_dir, input_sequence, alignment_index)
-        
+
+        # save template names if output dir is given
+        if template_names_out_path:
+            template_names = [
+                name.decode('utf-8') for name in template_features['template_domain_names']
+            ]
+            with open(template_names_out_path, "w") as f:
+                f.write("\n".join(template_names))
+
         return {
             **sequence_features,
             **msa_features, 
@@ -1163,7 +1349,8 @@ class DataPipelineMultimer:
             description: str,
             chain_alignment_dir: str,
             chain_alignment_index: Optional[Any],
-            is_homomer_or_monomer: bool
+            is_homomer_or_monomer: bool,
+            template_names_out_path: Optional[str] = None
     ) -> FeatureDict:
         """Runs the monomer pipeline on a single chain."""
         chain_fasta_str = f'>{chain_id}\n{sequence}\n'
@@ -1175,16 +1362,23 @@ class DataPipelineMultimer:
             chain_features = self._monomer_data_pipeline.process_fasta(
                 fasta_path=chain_fasta_path,
                 alignment_dir=chain_alignment_dir,
-                alignment_index=chain_alignment_index
+                alignment_index=chain_alignment_index,
+                template_names_out_path=template_names_out_path,
             )
 
             # We only construct the pairing features if there are 2 or more unique
             # sequences.
             if not is_homomer_or_monomer:
-                all_seq_msa_features = self._all_seq_msa_features(
-                    chain_alignment_dir,
-                    chain_alignment_index
-                )
+                if ":" in sequence:
+                    input_sequence = "".join(sequence.split(":"))
+                    all_seq_msa_features = self._mock_all_seq_msa_features(
+                            input_sequence
+                    )
+                else:
+                    all_seq_msa_features = self._all_seq_msa_features(
+                        chain_alignment_dir,
+                        chain_alignment_index
+                    )
                 chain_features.update(all_seq_msa_features)
         return chain_features
 
@@ -1225,10 +1419,19 @@ class DataPipelineMultimer:
         }
         return feats
 
+    @staticmethod
+    def _mock_all_seq_msa_features(input_sequence):
+        """Get MSA features for unclustered uniprot, for pairing."""
+        all_seq_features = make_dummy_msa_feats(input_sequence)
+        feats = {f'{k}_all_seq': v for k, v in all_seq_features.items()}
+
+        return feats
+
     def process_fasta(self,
                       fasta_path: str,
                       alignment_dir: str,
-                      alignment_index: Optional[Any] = None
+                      alignment_index: Optional[Any] = None,
+                      template_names_out_prefix: Optional[str] = None,
                       ) -> FeatureDict:
         """Creates features."""
         with open(fasta_path) as f:
@@ -1253,13 +1456,21 @@ class DataPipelineMultimer:
                 chain_alignment_index = None
                 chain_alignment_dir = os.path.join(alignment_dir, desc)
 
+            if template_names_out_prefix:
+                # template name output path for this chain
+                template_names_out_path = f"{template_names_out_prefix}.{desc}.txt"
+            else:
+                # names will not be saved if out path is None
+                template_names_out_path = None
+
             chain_features = self._process_single_chain(
                 chain_id=desc,
                 sequence=seq,
                 description=desc,
                 chain_alignment_dir=chain_alignment_dir,
                 chain_alignment_index=chain_alignment_index,
-                is_homomer_or_monomer=is_homomer_or_monomer
+                is_homomer_or_monomer=is_homomer_or_monomer,
+                template_names_out_path=template_names_out_path,
             )
 
             chain_features = convert_monomer_features(
@@ -1345,6 +1556,190 @@ class DataPipelineMultimer:
 
             mmcif_feats = self.get_mmcif_features(mmcif, chain_id)
             chain_features.update(mmcif_feats)
+            all_chain_features[desc] = chain_features
+            sequence_features[seq] = chain_features
+
+        all_chain_features = add_assembly_features(all_chain_features)
+
+        np_example = feature_processing_multimer.pair_and_merge(
+            all_chain_features=all_chain_features,
+        )
+
+        # Pad MSA to avoid zero-sized extra_msa.
+        np_example = pad_msa(np_example, 512)
+
+        return np_example
+
+    def get_protein_features(
+        self,
+        protein_object: protein.Protein,
+        chain_id: str
+    ) -> FeatureDict:
+        """Get structure features from protein_object for a given chain_id.
+
+        Args:
+            protein_object (Protein): protein object containing info for
+                the entire structure
+            chain_id (str): pdb chain_id e.g. "A", "B"
+        Returns:
+            feature dictionary
+        """
+        pdb_feats = {}
+
+        all_atom_positions, all_atom_mask = protein.get_atom_coords(
+            prot=protein_object, chain_id=chain_id
+        )
+
+        pdb_feats["all_atom_positions"] = all_atom_positions.astype(np.float32)
+        pdb_feats["all_atom_mask"] = all_atom_mask.astype(np.float32)
+
+        pdb_feats["resolution"] = np.array(0., dtype=np.float32)
+        pdb_feats["is_distillation"] = np.array(0., dtype=np.float32)
+
+        return pdb_feats
+
+    def get_mock_structure_features(
+        self,
+        chain_aatype,
+    ) -> FeatureDict:
+        """Get mock structure features for given chain features.
+
+        Args:
+            chain_features["aatype"]
+        Returns:
+            feature dictionary
+        """
+        structure_feats = {}
+
+        all_atom_mask = residue_constants.STANDARD_ATOM_MASK[
+            chain_aatype
+        ]
+        structure_feats['all_atom_mask'] = all_atom_mask.astype(
+            dtype=np.float32
+        )
+        structure_feats['all_atom_positions'] = np.zeros(
+            list(all_atom_mask.shape) + [3], dtype=np.float32
+        )
+        structure_feats["resolution"] = np.array(0., dtype=np.float32)
+        structure_feats["is_distillation"] = np.array(0., dtype=np.float32)
+
+        return structure_feats
+
+    def get_label_features(self, label_path: str):
+        """ Get label features for this structure.
+
+        Args:
+            label_path (str): path to .labels file containing, binding_status,
+                has_true_structure, and has_predicted_structure
+        Returns:
+            label_features (dict)
+        """
+        labels = pd.read_csv(label_path, sep="\t")
+        label_feats = {}
+        label_feats["binding_status"] = np.array(
+            labels["binding_status"].iloc[0],
+            dtype=np.float32
+        )
+        label_feats["has_true_structure"] = np.array(
+            labels["has_true_structure"].iloc[0],
+            dtype=np.float32
+        )
+        label_feats["has_predicted_structure"] = np.array(
+            labels["has_predicted_structure"].iloc[0],
+            dtype=np.float32
+        )
+
+        return label_feats
+
+    def get_label_features_from_cache(self, data: Dict):
+        """ Get label features from a data cache entry"""
+        label_features = {}
+        label_features["binding_status"] = np.array(
+            data["binding_status"],
+            dtype=np.float32
+        )
+        label_features["has_true_structure"] = np.array(
+            data["has_true_structure"],
+            dtype=np.float32
+        )
+        label_features["has_predicted_structure"] = np.array(
+            data["has_predicted_structure"],
+            dtype=np.float32
+        )
+
+        return label_features
+
+    def process_fasta_and_pdb(
+            self,
+            fasta_path: str,
+            alignment_dir: str,
+            alignment_index: Optional[Any] = None,
+            protein_object: Optional[protein.Protein] = None,
+            fasta_cid_to_pdb_cid: Optional[dict] = None
+    ) -> FeatureDict:
+        """Process fasta and cif/pdb files and return feature dict.
+
+        Args:
+            fasta_path (str): path to .fasta
+            alignment_dir (str): directory of directories, each containing
+                alignment files per chain
+            protein_object (Protein): object parsed from .pdb file
+            fasta_cid_to_pdb_cid (dict): maps fasta chain_id to pdb chain_id
+        Returns:
+            feature dictionary
+        """
+        if protein_object and not fasta_cid_to_pdb_cid:
+            raise ValueError("Missing mappings of fasta_cid to pdb_cid.")
+
+        with open(fasta_path) as f:
+            input_fasta_str = f.read()
+
+        input_seqs, input_desc = parsers.parse_fasta(input_fasta_str)
+
+        all_chain_features = {}
+        sequence_features = {}
+        is_homomer_or_monomer = len(set(input_seqs)) == 1
+        for desc, seq in zip(input_desc, input_seqs):
+            if seq in sequence_features:
+                all_chain_features[desc] = copy.deepcopy(
+                    sequence_features[seq]
+                )
+                continue
+
+            if alignment_index is not None:
+                chain_alignment_index = alignment_index.get(desc)
+                chain_alignment_dir = alignment_dir
+            else:
+                chain_alignment_index = None
+                chain_alignment_dir = os.path.join(alignment_dir, desc)
+
+            # sequence, MSA, template features
+            chain_features = self._process_single_chain(
+                chain_id=desc,
+                sequence=seq,
+                description=desc,
+                chain_alignment_dir=chain_alignment_dir,
+                chain_alignment_index=chain_alignment_index,
+                is_homomer_or_monomer=is_homomer_or_monomer
+            )
+
+            chain_features = convert_monomer_features(
+                chain_features,
+                chain_id=desc
+            )
+
+            # structure features
+            if protein_object:
+                structure_feats = self.get_protein_features(
+                    protein_object,
+                    fasta_cid_to_pdb_cid[desc]
+                )
+            else:
+                structure_feats = self.get_mock_structure_features(
+                    chain_features["aatype"]
+                )
+            chain_features.update(structure_feats)
+
             all_chain_features[desc] = chain_features
             sequence_features[seq] = chain_features
 

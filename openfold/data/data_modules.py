@@ -1,27 +1,43 @@
+# Modified by Adaptive Biotechnologies
 import copy
 from functools import partial
 import json
 import logging
+import math
 import os
+import tempfile
+import numpy as np
+import pandas as pd
 import pickle
-from typing import Optional, Sequence, Any, Union
+import random
+from typing import Optional, Sequence, Any, Union, Iterator, TypeVar
+import time
 
 import ml_collections as mlc
 import pytorch_lightning as pl
+from pytorch_lightning.loggers import WandbLogger
 import torch
-from torch.utils.data import RandomSampler
+import torch.distributed as dist
+from torch.utils.data.sampler import Sampler
+from openfold.np import protein
 from openfold.np.residue_constants import restypes
 from openfold.data import (
     data_pipeline,
     feature_pipeline,
     mmcif_parsing,
+    parsers,
     templates,
 )
 from openfold.utils.tensor_utils import dict_multimap
 from openfold.utils.tensor_utils import (
     tensor_tree_map,
 )
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
+_T_co = TypeVar("_T_co", covariant=True)
 
 class OpenFoldSingleDataset(torch.utils.data.Dataset):
     def __init__(self,
@@ -308,16 +324,17 @@ class OpenFoldSingleMultimerDataset(torch.utils.data.Dataset):
                  alignment_index: Optional[Any] = None,
                  _output_raw: bool = False,
                  _structure_index: Optional[Any] = None,
+                 pmhc_templates_dir: Optional[str] = None,
                  ):
         """
-        This class check each individual PDB ID and return its chain(s) features/ground truth 
+        This class check each individual PDB ID and return its chain(s) features/ground truth
             Args:
                 data_dir:
-                    A path to a directory containing mmCIF files (in train
-                    mode) or FASTA files (in inference mode).
+                    A path to a directory containing FASTA, label, and pdb
+                    files (in train mode) or FASTA files (in inference mode).
                 alignment_dir:
-                    A path to a directory containing only data in the format 
-                    output by an AlignmentRunner 
+                    A path to a directory containing only data in the format
+                    output by an AlignmentRunner
                     (defined in openfold.features.alignment_runner).
                     I.e. a directory of directories named {PDB_ID}_{CHAIN_ID}
                     or simply {PDB_ID}, each containing .a3m, .sto, and .hhr
@@ -351,6 +368,10 @@ class OpenFoldSingleMultimerDataset(torch.utils.data.Dataset):
                     special distillation set preprocessing steps).
                 mode:
                     "train", "val", or "predict"
+                pmhc_templates_dir:
+                    Directory containing pMHC PDB template files (e.g.
+                    7kgo.pmhc.pdb). Used by make_template_features_for_pmhc
+                    to resolve template paths from alignment TSV files.
         """
         super(OpenFoldSingleMultimerDataset, self).__init__()
         self.data_dir = data_dir
@@ -369,7 +390,7 @@ class OpenFoldSingleMultimerDataset(torch.utils.data.Dataset):
         self._output_raw = _output_raw
         self._structure_index = _structure_index
 
-        self.supported_exts = [".cif", ".core", ".pdb"]
+        self.supported_exts = [".cif", ".core", ".pdb", ".fasta", ".label"]
 
         valid_modes = ["train", "eval", "predict"]
         if mode not in valid_modes:
@@ -414,6 +435,7 @@ class OpenFoldSingleMultimerDataset(torch.utils.data.Dataset):
 
         data_processor = data_pipeline.DataPipeline(
             template_featurizer=template_featurizer,
+            pmhc_templates_dir=pmhc_templates_dir,
         )
         self.data_pipeline = data_pipeline.DataPipelineMultimer(
             monomer_data_pipeline=data_processor
@@ -442,6 +464,190 @@ class OpenFoldSingleMultimerDataset(torch.utils.data.Dataset):
         )
 
         return data
+    
+    def _parse_mira(
+            self,
+            structure_id,
+            alignment_dir,
+            alignment_index=None
+            ):
+        """Make a dictionary containing features, structure info, and labels.
+
+        Args:
+            structure_id (str)
+            alignment_dir (str)
+            alignment_index (int)
+        Returns:
+            data (dict)
+        """
+        # input file paths
+        fasta_path = os.path.join(self.data_dir, f"{structure_id}.fasta")
+        label_path = os.path.join(self.data_dir, f"{structure_id}.label")
+        pdb_path = os.path.join(self.data_dir, f"{structure_id}.pdb")
+
+        # get labels
+        label_features = self.data_pipeline.get_label_features(label_path)
+
+        # make structure object from pdb
+        protein_object = None
+        if (
+            label_features["has_true_structure"] == 1
+            or label_features["has_predicted_structure"] == 1
+        ):
+            if os.path.exists(pdb_path):
+                with open(pdb_path, 'r') as f:
+                    pdb_str = f.read()
+                protein_object = protein.from_pdb_string(pdb_str)
+            else:
+                raise ValueError(f"{structure_id} is labeled as having true or "
+                                 "predicted structure but is missing PDB file.")
+
+        # make mappings of fasta cid to pdb/cif cid if structure info exists
+        fasta_cid_to_pdb_cid = None
+        if protein_object:
+            fasta_cid_to_pdb_cid = {
+                key: val
+                for key, val in zip(
+                    self.mmcif_data_cache[structure_id]["fasta_chain_ids"],
+                    self.mmcif_data_cache[structure_id]["chain_ids"],
+                )
+            }
+
+        # Run process_fasta on 3-piece fasta to get template and sequence feats
+        data = self.data_pipeline.process_fasta(
+            fasta_path=fasta_path,
+            alignment_dir=alignment_dir,
+            alignment_index=alignment_index
+        )
+
+        # Run custom processing on 4-piece fasta and pdb to get MSA and structure feats
+        with tempfile.NamedTemporaryFile() as temp_fasta:
+            parsers.convert_fasta3_to_fasta4(fasta_path, temp_fasta.name)
+
+            data_four_piece = self.data_pipeline.process_fasta_and_pdb(
+                fasta_path=temp_fasta.name,
+                alignment_dir=alignment_dir,
+                alignment_index=alignment_index,
+                protein_object=protein_object,
+                fasta_cid_to_pdb_cid=fasta_cid_to_pdb_cid,
+            )
+
+        # replace MSA and structure features with those from 4-piece fasta
+        for feature in [
+            "msa",
+            "deletion_matrix",
+            "cluster_bias_mask",
+            "bert_mask",
+            "msa_mask",
+            "num_alignments",
+            "deletion_mean",
+            "all_atom_positions",  # pdb
+            "all_atom_mask",  # pdb
+        ]:
+            data[feature] = data_four_piece[feature]
+        # necessary for custom iptm scores
+        data["asym_id_tcra_tcrb_pep_mhc"] = data_four_piece["asym_id"]
+        # Replace resolution with the value from data cache, which in turn is derived from label file.
+        # Otherwise resolution for any pdb structure is set to 0 by data_pipeline
+        data["resolution"] = self.mmcif_data_cache[structure_id]["resolution"]
+
+        # add label features
+        data.update(label_features)
+
+        return data
+
+    def _parse_mira_from_cache(
+            self,
+            structure_id,
+            alignment_dir,
+            alignment_index=None
+            ):
+        """Make a dictionary containing features, structure info, and labels.
+
+        Args:
+            structure_id (str)
+            alignment_dir (str)
+            alignment_index (int)
+        Returns:
+            data (dict)
+        """
+        # get input data for this structure
+        input_data = self.mmcif_data_cache[structure_id]
+
+        # make structure object from pdb
+        protein_object = None
+        if (
+            input_data["has_true_structure"] == 1
+            or input_data["has_predicted_structure"] == 1
+        ):
+            pdb_path = os.path.join(self.data_dir, f"{structure_id}.pdb")
+            if os.path.exists(pdb_path):
+                with open(pdb_path, 'r') as f:
+                    pdb_str = f.read()
+                protein_object = protein.from_pdb_string(pdb_str)
+            else:
+                raise ValueError(f"{structure_id} is labeled as having true or "
+                                 "predicted structure but is missing PDB file.")
+
+        # make mappings of fasta cid to pdb/cif cid if structure info exists
+        fasta_cid_to_pdb_cid = None
+        if protein_object:
+            fasta_cid_to_pdb_cid = {
+                key: val
+                for key, val in zip(
+                    self.mmcif_data_cache[structure_id]["fasta_chain_ids"],
+                    self.mmcif_data_cache[structure_id]["chain_ids"],
+                )
+            }
+
+        with tempfile.NamedTemporaryFile() as temp_fasta3, tempfile.NamedTemporaryFile() as temp_fasta4:
+            # Make 3-piece fasta from input data
+            parsers.make_fasta3_from_cache(input_data, temp_fasta3.name)
+
+            # Run process_fasta on 3-piece fasta to get template and sequence features
+            data = self.data_pipeline.process_fasta(
+                fasta_path=temp_fasta3.name,
+                alignment_dir=alignment_dir,
+                alignment_index=alignment_index
+            )
+
+            # Make 4-piece fasta from input data
+            parsers.make_fasta4_from_cache(input_data, temp_fasta4.name)
+
+            # Run process_fasta_and_pdb on 4-piece fasta to get MSA and structure features
+            data_four_piece = self.data_pipeline.process_fasta_and_pdb(
+                fasta_path=temp_fasta4.name,
+                alignment_dir=alignment_dir,
+                alignment_index=alignment_index,
+                protein_object=protein_object,
+                fasta_cid_to_pdb_cid=fasta_cid_to_pdb_cid,
+            )
+
+        # replace MSA and structure features with those from 4-piece fasta
+        for feature in [
+            "msa",
+            "deletion_matrix",
+            "cluster_bias_mask",
+            "bert_mask",
+            "msa_mask",
+            "num_alignments",
+            "deletion_mean",
+            "all_atom_positions",  # pdb
+            "all_atom_mask",  # pdb
+        ]:
+            data[feature] = data_four_piece[feature]
+        # necessary for custom iptm scores
+        data["asym_id_tcra_tcrb_pep_mhc"] = data_four_piece["asym_id"]
+
+        # Add other required columns
+        data["sample_index"] = input_data["sample_index"]
+        data["resolution"] = input_data["resolution"]
+
+        # add label features
+        label_features = self.data_pipeline.get_label_features_from_cache(input_data)
+        data.update(label_features)
+
+        return data
 
     def mmcif_id_to_idx(self, mmcif_id):
         return self._mmcif_id_to_idx_dict[mmcif_id]
@@ -458,24 +664,27 @@ class OpenFoldSingleMultimerDataset(torch.utils.data.Dataset):
                                if f'{mmcif_id}_' in k}
 
         if self.mode == 'train' or self.mode == 'eval':
+            # If cif/fasta+label files exist, use those. Otherwise, use data cache.
             path = os.path.join(self.data_dir, f"{mmcif_id}")
-            ext = None
+            ext_list = []
             for e in self.supported_exts:
                 if os.path.exists(path + e):
-                    ext = e
-                    break
+                    ext_list.append(e)
 
-            if ext is None:
-                raise ValueError("Invalid file type")
-
-            # TODO: Add pdb and core exts to data_pipeline for multimer
-            path += ext
-            if ext == ".cif":
+            if len(ext_list) == 1 and ext_list[0] == ".cif":
+                path += ".cif"
                 data = self._parse_mmcif(
                     path, mmcif_id, self.alignment_dir, alignment_index,
                 )
+            elif ".fasta" in ext_list and ".label" in ext_list:
+                data = self._parse_mira(
+                    mmcif_id,
+                    self.alignment_dir,
+                )
+            elif self.mmcif_data_cache is not None:
+                data = self._parse_mira_from_cache(mmcif_id, self.alignment_dir)
             else:
-                raise ValueError("Extension branch missing")
+                raise ValueError(f"Train/eval files should be cif OR fasta + label OR cache. Found {ext_list} for structure {mmcif_id}.")
         else:
             path = os.path.join(self.data_dir, f"{mmcif_id}.fasta")
             data = self.data_pipeline.process_fasta(
@@ -503,6 +712,33 @@ class OpenFoldSingleMultimerDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self._mmcifs)
 
+    def get_sample_labels(self):
+        """Return labels for each unique sample in this dataset. Used for eval dataset.
+        """
+        rows = []
+        for sample_idx, mmcif_id in enumerate(self._mmcifs):
+            sample_info = self.mmcif_data_cache[mmcif_id]
+
+            rows.append([
+                sample_idx,
+                mmcif_id,
+                sample_info["binding_status"],
+                sample_info["has_predicted_structure"],
+                sample_info["has_true_structure"]
+            ])
+
+        df = pd.DataFrame(
+            rows,
+            columns=[
+                "sample_index",
+                "mmcif_id",
+                "binding_status",
+                "has_predicted_structure",
+                "has_true_structure",
+            ],
+        )
+
+        return df
 
 def resolution_filter(resolution: int, max_resolution: float) -> bool:
     """Check that the resolution is <= max_resolution permitted"""
@@ -544,6 +780,7 @@ class OpenFoldDataset(torch.utils.data.Dataset):
                  datasets: Union[Sequence[OpenFoldSingleDataset], Sequence[OpenFoldSingleMultimerDataset]],
                  probabilities: Sequence[float],
                  epoch_len: int,
+                 use_custom_sampler: bool,
                  generator: torch.Generator = None,
                  _roll_at_init: bool = True,
                  ):
@@ -551,10 +788,31 @@ class OpenFoldDataset(torch.utils.data.Dataset):
         self.probabilities = probabilities
         self.epoch_len = epoch_len
         self.generator = generator
-
+        self.use_custom_sampler = use_custom_sampler
         self._samples = [self.looped_samples(i) for i in range(len(self.datasets))]
         if _roll_at_init:
             self.reroll()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        generator = state.pop("generator", None)
+        state.pop("_samples", None)
+        state["_generator_state"] = (
+            bytes(generator.get_state().tolist()) if generator is not None else None
+        )
+        return state
+
+    def __setstate__(self, state):
+        generator_state = state.pop("_generator_state", None)
+        self.__dict__.update(state)
+        if generator_state is None:
+            self.generator = None
+        else:
+            self.generator = torch.Generator()
+            self.generator.set_state(
+                torch.tensor(list(generator_state), dtype=torch.uint8)
+            )
+        self._samples = [self.looped_samples(i) for i in range(len(self.datasets))]
 
     @staticmethod
     def deterministic_train_filter(
@@ -645,20 +903,70 @@ class OpenFoldDataset(torch.utils.data.Dataset):
         return self.datasets[dataset_idx][datapoint_idx]
 
     def __len__(self):
-        return self.epoch_len
+        return len(self.datapoints)
 
     def reroll(self):
-        dataset_choices = torch.multinomial(
-            torch.tensor(self.probabilities),
-            num_samples=self.epoch_len,
-            replacement=True,
-            generator=self.generator,
-        )
+        if self.use_custom_sampler:
+            num_pos = len(self.datasets[0]) # assume first dataset contains mira positives
+            num_neg = num_pos # assume 1:1 pos to neg ratio
+            num_crystal = len(self.datasets[2]) # assume third dataset contains crystal structures
+
+            dataset_choices = np.concatenate(
+                (
+                    np.zeros(num_pos, dtype=int),
+                    np.zeros(num_neg, dtype=int) + 1,
+                    np.zeros(num_crystal, dtype=int) + 2,
+                )
+            )
+
+        else:
+            dataset_choices = torch.multinomial(
+                torch.tensor(self.probabilities),
+                num_samples=self.epoch_len,
+                replacement=True,
+                generator=self.generator,
+            )
+
         self.datapoints = []
         for dataset_idx in dataset_choices:
             samples = self._samples[dataset_idx]
             datapoint_idx = next(samples)
-            self.datapoints.append((dataset_idx, datapoint_idx))
+            self.datapoints.append((int(dataset_idx), int(datapoint_idx)))
+
+    def get_sample_labels(self):
+        """Return labels for each unique sample in this dataset
+        """
+        rows = []
+        seen = set()
+        for sample_idx, (dataset_idx, datapoint_idx) in enumerate(self.datapoints):
+            dataset_idx = int(dataset_idx)
+            datapoint_idx = int(datapoint_idx)
+            if (dataset_idx, datapoint_idx) in seen:
+                continue
+
+            dataset = self.datasets[dataset_idx]
+            mmcif_id = dataset.idx_to_mmcif_id(datapoint_idx)
+            sample_info = dataset.mmcif_data_cache[mmcif_id]
+
+            rows.append([
+                sample_idx,
+                mmcif_id,
+                sample_info["binding_status"],
+                sample_info["has_predicted_structure"],
+                sample_info["has_true_structure"]
+            ])
+
+            seen.add((dataset_idx, datapoint_idx))
+
+        df = pd.DataFrame(rows, columns=[
+            "sample_index",
+            "mmcif_id",
+            "binding_status",
+            "has_predicted_structure",
+            "has_true_structure",
+        ])
+
+        return df
 
 
 class OpenFoldMultimerDataset(OpenFoldDataset):
@@ -672,12 +980,14 @@ class OpenFoldMultimerDataset(OpenFoldDataset):
                  datasets: Sequence[OpenFoldSingleMultimerDataset],
                  probabilities: Sequence[float],
                  epoch_len: int,
+                 use_custom_sampler: bool,
                  generator: torch.Generator = None,
                  _roll_at_init: bool = True
                  ):
         super(OpenFoldMultimerDataset, self).__init__(datasets=datasets,
                                                       probabilities=probabilities,
                                                       epoch_len=epoch_len,
+                                                      use_custom_sampler=use_custom_sampler,
                                                       generator=generator,
                                                       _roll_at_init=_roll_at_init)
 
@@ -747,7 +1057,16 @@ class OpenFoldMultimerDataset(OpenFoldDataset):
             )
             samples = samples.squeeze()
 
-            cache = [i for i, s in zip(idx, samples) if s]
+            cache_chain_level = [i for i, s in zip(idx, samples) if s]
+
+            # Convert chain-level samples to structure-level samples
+            # E.g., [2,2,2,2,0,0,0,0,1,1,1,1] --> [2,0,1]
+            seen = set()
+            cache = []
+            for item in cache_chain_level:
+                if item not in seen:
+                    cache.append(item)
+                    seen.add(item)
 
             for datapoint_idx in cache:
                 yield datapoint_idx
@@ -870,12 +1189,14 @@ class OpenFoldDataModule(pl.LightningDataModule):
                  _distillation_structure_index_path: Optional[str] = None,
                  alignment_index_path: Optional[str] = None,
                  distillation_alignment_index_path: Optional[str] = None,
+                 pmhc_templates_dir: Optional[str] = None,
                  **kwargs
                  ):
         super(OpenFoldDataModule, self).__init__()
 
         self.config = config
         self.template_mmcif_dir = template_mmcif_dir
+        self.pmhc_templates_dir = pmhc_templates_dir
         self.max_template_date = max_template_date
         self.train_data_dir = train_data_dir
         self.train_alignment_dir = train_alignment_dir
@@ -937,6 +1258,23 @@ class OpenFoldDataModule(pl.LightningDataModule):
             with open(distillation_alignment_index_path, "r") as fp:
                 self.distillation_alignment_index = json.load(fp)
 
+        self.num_pos_crystal_per_train_batch = kwargs["num_pos_crystal_per_train_batch"]
+        self.num_pos_predicted_per_train_batch = kwargs["num_pos_predicted_per_train_batch"]
+        self.num_pos_no_structure_per_train_batch = kwargs["num_pos_no_structure_per_train_batch"]
+        self.num_neg_no_structure_per_train_batch = kwargs["num_neg_no_structure_per_train_batch"]
+
+        self.num_pos_crystal_per_val_batch = kwargs["num_pos_crystal_per_val_batch"]
+        self.num_pos_predicted_per_val_batch = kwargs["num_pos_predicted_per_val_batch"]
+        self.num_pos_no_structure_per_val_batch = kwargs["num_pos_no_structure_per_val_batch"]
+        self.num_neg_no_structure_per_val_batch = kwargs["num_neg_no_structure_per_val_batch"]
+
+        self.num_samples_per_validation = kwargs["num_samples_per_validation"]
+        self.use_custom_sampler = kwargs["use_custom_sampler"]
+        self.seed = kwargs["seed"]
+
+        self.wandb_logger = None # for logging batch info to wandb
+        self.output_dir = kwargs['output_dir']
+
     def setup(self, stage=None):
         # Most of the arguments are the same for the three datasets 
         dataset_gen = partial(OpenFoldSingleDataset,
@@ -993,6 +1331,7 @@ class OpenFoldDataModule(pl.LightningDataModule):
                 datasets=datasets,
                 probabilities=probabilities,
                 epoch_len=self.train_epoch_len,
+                use_custom_sampler=self.use_custom_sampler,
                 generator=generator,
                 _roll_at_init=False,
             )
@@ -1018,16 +1357,53 @@ class OpenFoldDataModule(pl.LightningDataModule):
 
     def _gen_dataloader(self, stage=None):
         generator = None
+        sampler = None
         if self.batch_seed is not None:
             generator = torch.Generator()
             generator = generator.manual_seed(self.batch_seed)
 
         if stage == "train":
             dataset = self.train_dataset
-            # Filter the dataset, if necessary
+            # For custom sampler, reroll populates the dataset with all positives, 
+            # all crystals, and a subset of randomly selected negatives from a large pool. 
             dataset.reroll()
+            # custom sampler for multi-GPU training
+            if self.use_custom_sampler:
+                sampler = OpenFoldDistributedSampler(
+                    dataset=dataset,
+                    stage=stage,
+                    num_pos_crystal_per_batch=self.num_pos_crystal_per_train_batch,
+                    num_pos_predicted_per_batch=self.num_pos_predicted_per_train_batch,
+                    num_pos_no_structure_per_batch=self.num_pos_no_structure_per_train_batch,
+                    num_neg_no_structure_per_batch=self.num_neg_no_structure_per_train_batch,
+                    output_dir=self.output_dir,
+                    data_subset_size=self.train_epoch_len,
+                    wandb_logger=self.wandb_logger,
+                    seed=self.seed,
+                )
+                # Must set the epoch manually for sampler since set_epoch is not called by Trainer
+                # when resuming training mid-epoch.
+                sampler.set_epoch(self.trainer.current_epoch)
+
         elif stage == "eval":
             dataset = self.eval_dataset
+            # custom sampler for multi-GPU validation
+            if self.use_custom_sampler:
+                sampler = OpenFoldDistributedSampler(
+                    dataset=dataset,
+                    stage=stage,
+                    num_pos_crystal_per_batch=self.num_pos_crystal_per_val_batch,
+                    num_pos_predicted_per_batch=self.num_pos_predicted_per_val_batch,
+                    num_pos_no_structure_per_batch=self.num_pos_no_structure_per_val_batch,
+                    num_neg_no_structure_per_batch=self.num_neg_no_structure_per_val_batch,
+                    output_dir=self.output_dir,
+                    data_subset_size=self.num_samples_per_validation,
+                    wandb_logger=self.wandb_logger,
+                    seed=self.seed,
+                )
+                # Must set the epoch manually for sampler since set_epoch is not called by Trainer
+                # when resuming training mid-epoch.
+                sampler.set_epoch(self.trainer.current_epoch)
         elif stage == "predict":
             dataset = self.predict_dataset
         else:
@@ -1035,14 +1411,20 @@ class OpenFoldDataModule(pl.LightningDataModule):
 
         batch_collator = OpenFoldBatchCollator()
 
+        num_workers = self.config.data_module.data_loaders.num_workers
+        timeout = 300 if num_workers > 0 else 0
         dl = OpenFoldDataLoader(
             dataset,
             config=self.config,
             stage=stage,
             generator=generator,
             batch_size=self.config.data_module.data_loaders.batch_size,
-            num_workers=self.config.data_module.data_loaders.num_workers,
+            num_workers=num_workers,
             collate_fn=batch_collator,
+            sampler=sampler,
+            persistent_workers=num_workers > 0,
+            multiprocessing_context="forkserver" if num_workers > 0 else None,
+            timeout=timeout,
         )
 
         return dl
@@ -1057,6 +1439,9 @@ class OpenFoldDataModule(pl.LightningDataModule):
 
     def predict_dataloader(self):
         return self._gen_dataloader("predict")
+    
+    def set_wandb_logger(self, wandb_logger: WandbLogger):
+        self.wandb_logger = wandb_logger
 
 
 class OpenFoldMultimerDataModule(OpenFoldDataModule):
@@ -1072,7 +1457,9 @@ class OpenFoldMultimerDataModule(OpenFoldDataModule):
     def __init__(self, config: mlc.ConfigDict,
                  template_mmcif_dir: str, max_template_date: str,
                  train_data_dir: Optional[str] = None,
-                 train_mmcif_data_cache_path: Optional[str] = None,
+                 train_pos_mmcif_data_cache_path: Optional[str] = None,
+                 train_neg_mmcif_data_cache_path: Optional[str] = None,
+                 train_crystal_mmcif_data_cache_path: Optional[str] = None,
                  val_mmcif_data_cache_path: Optional[str] = None,
                  **kwargs):
         super(OpenFoldMultimerDataModule, self).__init__(config,
@@ -1081,11 +1468,13 @@ class OpenFoldMultimerDataModule(OpenFoldDataModule):
                                                          train_data_dir,
                                                          **kwargs)
 
-        self.train_mmcif_data_cache_path = train_mmcif_data_cache_path
+        self.train_pos_mmcif_data_cache_path = train_pos_mmcif_data_cache_path
+        self.train_neg_mmcif_data_cache_path = train_neg_mmcif_data_cache_path
+        self.train_crystal_mmcif_data_cache_path = train_crystal_mmcif_data_cache_path
         self.training_mode = self.train_data_dir is not None
         self.val_mmcif_data_cache_path = val_mmcif_data_cache_path
 
-    def setup(self, setup=None):
+    def setup(self, stage=None):
         # Most of the arguments are the same for the three datasets 
         dataset_gen = partial(OpenFoldSingleMultimerDataset,
                               template_mmcif_dir=self.template_mmcif_dir,
@@ -1093,12 +1482,37 @@ class OpenFoldMultimerDataModule(OpenFoldDataModule):
                               config=self.config,
                               kalign_binary_path=self.kalign_binary_path,
                               template_release_dates_cache_path=self.template_release_dates_cache_path,
-                              obsolete_pdbs_file_path=self.obsolete_pdbs_file_path)
+                              obsolete_pdbs_file_path=self.obsolete_pdbs_file_path,
+                              pmhc_templates_dir=self.pmhc_templates_dir)
 
         if self.training_mode:
-            train_dataset = dataset_gen(
+            train_pos_dataset = dataset_gen(
                 data_dir=self.train_data_dir,
-                mmcif_data_cache_path=self.train_mmcif_data_cache_path,
+                mmcif_data_cache_path=self.train_pos_mmcif_data_cache_path,
+                alignment_dir=self.train_alignment_dir,
+                filter_path=self.train_filter_path,
+                max_template_hits=self.config.train.max_template_hits,
+                shuffle_top_k_prefiltered=self.config.train.shuffle_top_k_prefiltered,
+                treat_pdb_as_distillation=False,
+                mode="train",
+                alignment_index=self.alignment_index,
+            )
+
+            train_neg_dataset = dataset_gen(
+                data_dir=self.train_data_dir,
+                mmcif_data_cache_path=self.train_neg_mmcif_data_cache_path,
+                alignment_dir=self.train_alignment_dir,
+                filter_path=self.train_filter_path,
+                max_template_hits=self.config.train.max_template_hits,
+                shuffle_top_k_prefiltered=self.config.train.shuffle_top_k_prefiltered,
+                treat_pdb_as_distillation=False,
+                mode="train",
+                alignment_index=self.alignment_index,
+            )
+
+            train_crystal_dataset = dataset_gen(
+                data_dir=self.train_data_dir,
+                mmcif_data_cache_path=self.train_crystal_mmcif_data_cache_path,
                 alignment_dir=self.train_alignment_dir,
                 filter_path=self.train_filter_path,
                 max_template_hits=self.config.train.max_template_hits,
@@ -1121,15 +1535,22 @@ class OpenFoldMultimerDataModule(OpenFoldDataModule):
                     _structure_index=self._distillation_structure_index,
                 )
 
-                d_prob = self.config.train.distillation_prob
+                d_prob = self.config.train.distillation_prob            
 
             if distillation_dataset is not None:
-                datasets = [train_dataset, distillation_dataset]
+                datasets = [
+                    train_pos_dataset, 
+                    train_neg_dataset, 
+                    train_crystal_dataset, 
+                    distillation_dataset,
+                ]
                 d_prob = self.config.train.distillation_prob
-                probabilities = [1. - d_prob, d_prob]
+                p = (1. - d_prob) / 3
+                probabilities = [p, p, p, d_prob] # dummy probs
             else:
-                datasets = [train_dataset]
-                probabilities = [1.]
+                datasets = [train_pos_dataset, train_neg_dataset, train_crystal_dataset,]
+                p = 1. / 3
+                probabilities = [p, p, p] # dummy probs
 
             generator = None
             if self.batch_seed is not None:
@@ -1140,6 +1561,7 @@ class OpenFoldMultimerDataModule(OpenFoldDataModule):
                 datasets=datasets,
                 probabilities=probabilities,
                 epoch_len=self.train_epoch_len,
+                use_custom_sampler=self.use_custom_sampler,
                 generator=generator,
                 _roll_at_init=True,
             )
@@ -1149,7 +1571,7 @@ class OpenFoldMultimerDataModule(OpenFoldDataModule):
                     data_dir=self.val_data_dir,
                     alignment_dir=self.val_alignment_dir,
                     mmcif_data_cache_path=self.val_mmcif_data_cache_path,
-                    filter_path=None,
+                    filter_path=self.train_filter_path,
                     max_template_hits=self.config.eval.max_template_hits,
                     mode="eval",
                 )
@@ -1184,3 +1606,374 @@ class DummyDataLoader(pl.LightningDataModule):
 
     def train_dataloader(self):
         return torch.utils.data.DataLoader(self.dataset)
+
+class OpenFoldDistributedSampler(Sampler[_T_co]):
+    r"""Sampler that restricts data loading to a subset of the dataset.
+
+    It is especially useful in conjunction with
+    :class:`torch.nn.parallel.DistributedDataParallel`. In such a case, each
+    process can pass a :class:`~torch.utils.data.DistributedSampler` instance as a
+    :class:`~torch.utils.data.DataLoader` sampler, and load a subset of the
+    original dataset that is exclusive to it.
+
+    .. note::
+        Dataset is assumed to be of constant size and that any instance of it always
+        returns the same elements in the same order.
+
+    Args:
+        dataset: Dataset used for sampling.
+        num_pos_crystal_per_batch (int): Target number of binders with crystal
+            structures per batch
+        num_pos_predicted_per_batch (int): Target number of binders with
+            predicted structures per batch
+        num_pos_no_structure_per_batch (int): Target number of binders with
+            no structures per batch
+        num_neg_no_structure_per_batch (int): Target number of nonbinders with
+            no structures per batch
+        data_subset_size (int, optional): How many samples to process across all GPUs
+        num_replicas (int, optional): Number of processes participating in
+            distributed training. By default, :attr:`world_size` is retrieved from the
+            current distributed group.
+        rank (int, optional): Rank of the current process within :attr:`num_replicas`.
+            By default, :attr:`rank` is retrieved from the current distributed
+            group.
+        shuffle (bool, optional): If ``True`` (default), sampler will shuffle the
+            indices.
+        seed (int, optional): random seed used to shuffle the sampler if
+            :attr:`shuffle=True`. This number should be identical across all
+            processes in the distributed group. Default: ``0``.
+        drop_last (bool, optional): if ``True``, then the sampler will drop the
+            tail of the data to make it evenly divisible across the number of
+            replicas. If ``False``, the sampler will add extra indices to make
+            the data evenly divisible across the replicas. Default: ``False``.
+    """
+
+    def __init__(
+        self,
+        dataset: Union[OpenFoldMultimerDataset, OpenFoldSingleMultimerDataset],
+        stage: str,
+        num_pos_crystal_per_batch: int,
+        num_pos_predicted_per_batch: int,
+        num_pos_no_structure_per_batch: int,
+        num_neg_no_structure_per_batch: int,
+        output_dir: str,
+        data_subset_size: Optional[int] = None,
+        num_replicas: Optional[int] = None,
+        rank: Optional[int] = None,
+        seed: int = 0,
+        drop_last: bool = False,
+        wandb_logger: WandbLogger = None,
+    ) -> None:
+        if num_replicas is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            if not dist.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = dist.get_rank()
+        if rank >= num_replicas or rank < 0:
+            raise ValueError(
+                f"Invalid rank {rank}, rank should be in the interval [0, {num_replicas - 1}]"
+            )
+        self.dataset = dataset
+        self.stage = stage
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.epoch = 0
+        self.current_seed = None
+        self.drop_last = drop_last
+        if data_subset_size:
+            dataset_size = data_subset_size
+        else:
+            dataset_size = len(self.dataset)
+        # If the dataset length is evenly divisible by # of replicas, then there
+        # is no need to drop any data, since the dataset will be split equally.
+        if self.drop_last and dataset_size % self.num_replicas != 0:  # type: ignore[arg-type]
+            # Split to nearest available length that is evenly divisible.
+            # This is to ensure each rank receives the same amount of data when
+            # using this Sampler.
+            self.num_samples = math.ceil(
+                (dataset_size - self.num_replicas) / self.num_replicas  # type: ignore[arg-type]
+            )
+        else:
+            self.num_samples = math.ceil(dataset_size / self.num_replicas)  # type: ignore[arg-type]
+        self.total_size = self.num_samples * self.num_replicas
+        self.seed = seed
+        self.output_dir = output_dir
+
+        # samples of each type in a batch
+        self.num_pos_crystal_per_batch = num_pos_crystal_per_batch
+        self.num_pos_predicted_per_batch = num_pos_predicted_per_batch
+        self.num_pos_no_structure_per_batch = num_pos_no_structure_per_batch
+        self.num_neg_no_structure_per_batch = num_neg_no_structure_per_batch
+
+        # logger
+        self.wandb_logger = wandb_logger
+
+        # get sample type info for each unique sample in dataset
+        self.sample_labels = self.dataset.get_sample_labels()
+        if (
+            sum(
+                (self.sample_labels["has_true_structure"] == 1)
+                & (self.sample_labels["has_predicted_structure"] == 1)
+            )
+            > 0
+        ):
+            raise ValueError(f"Found samples with both true and "
+                             f"predicted structures in {stage} dataset.")
+
+        # group sample indices by sample type
+        self.indices_pos_crystal = self.sample_labels[
+            (self.sample_labels["binding_status"] == 1)
+            & (self.sample_labels["has_true_structure"] == 1)
+            & (self.sample_labels["has_predicted_structure"] == 0)
+        ]["sample_index"].tolist()
+        self.indices_pos_predicted = self.sample_labels[
+            (self.sample_labels["binding_status"] == 1)
+            & (self.sample_labels["has_true_structure"] == 0)
+            & (self.sample_labels["has_predicted_structure"] == 1)
+        ]["sample_index"].tolist()
+        self.indices_pos_no_structure = self.sample_labels[
+            (self.sample_labels["binding_status"] == 1)
+            & (self.sample_labels["has_true_structure"] == 0)
+            & (self.sample_labels["has_predicted_structure"] == 0)
+        ]["sample_index"].tolist()
+        self.indices_neg_no_structure = self.sample_labels[
+            (self.sample_labels["binding_status"] == 0)
+            & (self.sample_labels["has_true_structure"] == 0)
+            & (self.sample_labels["has_predicted_structure"] == 0)
+        ]["sample_index"].tolist()
+
+        # throw error if requested sample types are not available in the dataset
+        if (
+            (len(self.indices_pos_crystal) == 0 and self.num_pos_crystal_per_batch > 0)
+            or (len(self.indices_pos_predicted) == 0 and self.num_pos_predicted_per_batch > 0)
+            or (len(self.indices_pos_no_structure) == 0 and self.num_pos_no_structure_per_batch > 0)
+            or (len(self.indices_neg_no_structure) == 0 and self.num_neg_no_structure_per_batch > 0)
+        ):
+            raise ValueError(
+                "Requested sample types are not available in the dataset."
+            )
+
+        # print sample usage stats in training
+        if stage == "train" and self.rank == 0:
+            # num_sample is equivalent to num batches in an epoch
+            pos_crystal_usage = min(
+                self.num_pos_crystal_per_batch * self.num_samples,
+                len(self.indices_pos_crystal)
+            )
+            pos_predicted_usage = min(
+                self.num_pos_predicted_per_batch * self.num_samples,
+                len(self.indices_pos_predicted)
+            )
+            pos_no_structure_usage = min(
+                self.num_pos_no_structure_per_batch * self.num_samples,
+                len(self.indices_pos_no_structure)
+            )
+            neg_no_structure_usage = min(
+                self.num_neg_no_structure_per_batch * self.num_samples,
+                len(self.indices_neg_no_structure)
+            )
+
+            print()
+            print("INPUT TRAIN DATASET:")
+            print(f"Positive, crystal structures: {len(self.indices_pos_crystal)}")
+            print(f"Positive, predicted structures: {len(self.indices_pos_predicted)}")
+            print(f"Positive, no structures: {len(self.indices_pos_no_structure)}")
+            print(f"Negative, no structures: {len(self.indices_neg_no_structure)}")
+            print()
+
+            print("NUMBER OF UNIQUE SAMPLES USED IN TRAINING:")
+            print(f"Positive, crystal structures: {pos_crystal_usage}")
+            print(f"Positive, predicted structures: {pos_predicted_usage}")
+            print(f"Positive, no structures: {pos_no_structure_usage}")
+            print(f"Negative, no structures: {neg_no_structure_usage}")
+            print()
+
+    def _cyclic_shuffled_list(self, my_list):
+        """Indefinitely loop through list while reshuffling every time the end
+        of list is reached.
+        """
+        while True:
+            shuffled_list = my_list[:]
+            random.shuffle(shuffled_list)
+            for item in shuffled_list:
+                yield item
+
+    def __iter__(self) -> Iterator[_T_co]:
+        # For train, set seed based on epoch
+        if self.stage == "train":
+            current_seed = self.seed + self.epoch
+        # For validation, set seed based on clock time.
+        # (i.e. Validation set will be random and not reproducible.)
+        elif self.stage == "eval":
+            if self.rank == 0:
+                current_seed = self.seed + int(time.time())
+            else:
+                current_seed = 0  # placeholder for other ranks
+            # Broadcast the seed from rank 0 to all GPUs since clock time is different across GPUs.
+            seed_tensor = torch.tensor(
+                [current_seed], dtype=torch.int64, device=torch.cuda.current_device()
+            )
+            dist.broadcast(seed_tensor, src=0)
+            current_seed = seed_tensor.item()
+        else:
+            raise ValueError(f"Invalid stage in custom sampler: {self.stage}.")
+
+        self.current_seed = current_seed
+        random.seed(self.current_seed)
+
+        pos_crystal_cycle = self._cyclic_shuffled_list(
+            self.indices_pos_crystal
+        )
+        pos_predicted_cycle = self._cyclic_shuffled_list(
+            self.indices_pos_predicted
+        )
+        pos_no_structure_cycle = self._cyclic_shuffled_list(
+            self.indices_pos_no_structure
+        )
+        neg_no_structure_cycle = self._cyclic_shuffled_list(
+            self.indices_neg_no_structure
+        )
+
+        indices = [] # indices for all batches
+        while len(indices) < self.total_size:
+            temp = [] # indices for current batch
+            temp.extend([next(pos_crystal_cycle) for _ in range(self.num_pos_crystal_per_batch)])
+            temp.extend([next(pos_predicted_cycle) for _ in range(self.num_pos_predicted_per_batch)])
+            temp.extend([next(pos_no_structure_cycle) for _ in range(self.num_pos_no_structure_per_batch)])
+            temp.extend([next(neg_no_structure_cycle) for _ in range(self.num_neg_no_structure_per_batch)])
+            # shuffle indices so that each GPU doesn't get the same sample repeatedly
+            random.shuffle(temp)
+            indices.extend(temp)
+        assert len(indices) == self.total_size
+
+        # Log batch id of each sample to wandb so we can track which
+        # samples are being processed
+        if self.rank == 0:
+            batch_info = self.get_batch_info(indices)
+            self.save_batch_info_to_local(batch_info)
+
+            if self.wandb_logger and self.wandb_logger.experiment:
+                self.save_batch_info_to_wandb(batch_info)
+
+
+        # subsample indices for current gpu
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        assert len(indices) == self.num_samples
+
+        return iter(indices)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
+        """
+        Set the epoch for this sampler.
+
+        When :attr:`shuffle=True`, this ensures all replicas
+        use a different random ordering for each epoch. Otherwise, the next iteration of this
+        sampler will yield the same ordering.
+
+        Args:
+            epoch (int): Epoch number.
+        """
+        self.epoch = epoch
+
+    def get_batch_info(self, indices):
+        """
+        Get dataframe containing batch info (e.g. batch id, labels) for each sample.
+
+        Args:
+            indices (list of int): Sample indices ordered by batch and gpu rank.
+                i.e. [batch0_gpu0, batch0_gpu1, ..., batch1_gpu0, batch1_gpu1, ...]
+        Returns:
+            pd.DataFrame
+        """
+        # map sample index to sample info for faster searching later
+        index_to_info = {}
+        for _, row in self.sample_labels.iterrows():
+            index_to_info[row["sample_index"]] = [
+                row["mmcif_id"],
+                row["binding_status"],
+                row["has_true_structure"],
+                row["has_predicted_structure"],
+            ]
+
+        data = []
+        # iterate over batches
+        # self.num_samples is equivalent to num total batches
+        for batch_idx in range(self.num_samples):
+            start_idx = batch_idx * self.num_replicas
+            # iterate over gpus in this batch
+            for device_rank in range(self.num_replicas):
+                sample_idx = indices[start_idx + device_rank]
+                sample_info = index_to_info[sample_idx]
+                data.append(
+                    {
+                        "batch_id": batch_idx,
+                        "device_rank": device_rank,
+                        "sample_id": sample_info[0],
+                        "binding_status": sample_info[1],
+                        "has_true_structure": sample_info[2],
+                        "has_predicted_structure": sample_info[3],
+                    }
+                )
+
+        return pd.DataFrame(data)
+
+    def save_batch_info_to_wandb(self, batch_info):
+        """
+        Save batch info to wandb.
+
+        Args:
+            batch_info (pd.DataFrame)
+        """
+        artifact = wandb.Artifact(
+            name=f"{self.wandb_logger.experiment.name}_{self.stage}_batch_info.epoch{self.epoch}",
+            type=f"{self.stage}_batch_info",
+            metadata={
+                "epoch": self.epoch,
+                "seed": self.current_seed,
+            },
+        )
+        # Add the first 100 rows of batch info as a displayable table
+        wandb_table = wandb.Table(dataframe=batch_info[0:min(100, len(batch_info))])
+        artifact.add(wandb_table, "batch_info")
+
+        # Add the full table as a tsv file
+        batch_info_local_path = os.path.join(
+            self.output_dir,
+            "batch_info",
+            f"{self.stage}_batch_info.epoch{self.epoch}.seed{self.current_seed}.tsv"
+        )
+        if os.path.exists(batch_info_local_path):
+            artifact.add_file(batch_info_local_path)
+        else:
+            logging.warning(
+                f"{batch_info_local_path} does not exist in local directory. "
+                "Skipping uploading it to wandb."
+            )
+
+        self.wandb_logger.experiment.log_artifact(artifact)
+
+    def save_batch_info_to_local(self, batch_info):
+        """
+        Save batch info to local output dir.
+
+        Args:
+            batch_info (pd.DataFrame)
+        """
+        local_output_dir = os.path.join(self.output_dir, "batch_info")
+        if not os.path.exists(local_output_dir):
+            os.makedirs(local_output_dir)
+
+        batch_info.to_csv(
+            os.path.join(
+                local_output_dir,
+                f"{self.stage}_batch_info.epoch{self.epoch}.seed{self.current_seed}.tsv"
+            ),
+            index=False,
+            sep="\t",
+        )

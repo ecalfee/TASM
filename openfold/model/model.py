@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by Adaptive Biotechnologies
 from functools import partial
 import weakref
 
@@ -38,6 +39,7 @@ from openfold.model.embedders import (
 from openfold.model.evoformer import EvoformerStack, ExtraMSAStack
 from openfold.model.heads import AuxiliaryHeads
 from openfold.model.structure_module import StructureModule
+from openfold.model.classifiers import LogisticRegression
 from openfold.model.template import (
     TemplatePairStack,
     TemplatePointwiseAttention,
@@ -132,6 +134,8 @@ class AlphaFold(nn.Module):
         self.aux_heads = AuxiliaryHeads(
             self.config["heads"],
         )
+        if self.config.classifier.use_classifier:
+            self.classifier = LogisticRegression(**self.config["classifier"])
 
     def embed_templates(self, batch, feats, z, pair_mask, templ_dim, inplace_safe):
         if self.globals.is_multimer:
@@ -584,8 +588,19 @@ class AlphaFold(nn.Module):
 
         if "asym_id" in batch:
             outputs["asym_id"] = feats["asym_id"]
+        if "asym_id_tcra_tcrb_pep_mhc" in batch: # added to get TCRmodel2-like TCR-pMHC ipTM score
+            outputs["asym_id_tcra_tcrb_pep_mhc"] = feats["asym_id_tcra_tcrb_pep_mhc"]
 
         # Run auxiliary heads
         outputs.update(self.aux_heads(outputs))
+
+        # classify binding
+        if self.classifier:
+            outputs["binding_logits"] = self.classifier(
+                outputs["iptm_tcr_pmhc_score"]
+            )
+            # outputs["binding_prob"] = torch.sigmoid(
+            #     outputs["binding_logits"]
+            # )
 
         return outputs

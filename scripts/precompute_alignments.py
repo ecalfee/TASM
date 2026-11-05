@@ -1,3 +1,4 @@
+# Modified by Adaptive Biotechnologies
 import argparse
 from functools import partial
 import json
@@ -5,7 +6,7 @@ import logging
 import os
 import threading
 from multiprocessing import cpu_count
-from shutil import copyfile
+import shutil
 import tempfile
 
 import openfold.data.mmcif_parsing as mmcif_parsing
@@ -20,17 +21,20 @@ from utils import add_data_args
 logging.basicConfig(level=logging.WARNING)
 
 
-def run_seq_group_alignments(seq_groups, alignment_runner, args):
-    dirs = set(os.listdir(args.output_dir))
+def run_seq_group_alignments(seq_groups, alignment_runner, args,
+                             completed_chains, errored_chains,
+                             skipped_chains):
+    dirs = set(os.listdir(args.output_dir)) if os.path.isdir(args.output_dir) else set()
     for seq, names in seq_groups:
         first_name = names[0]
         alignment_dir = os.path.join(args.output_dir, first_name)
-        
-        try:
-            os.makedirs(alignment_dir)
-        except Exception as e:
-            logging.warning(f"Failed to create directory for {first_name} with exception {e}...")
+
+        if first_name in dirs:
+            logging.warning(f"Directory for {first_name} already exists. Skipping...")
+            skipped_chains.append(first_name)
             continue
+
+        os.makedirs(alignment_dir)
 
         fd, fasta_path = tempfile.mkstemp(suffix=".fasta")
         with os.fdopen(fd, 'w') as fp:
@@ -38,32 +42,37 @@ def run_seq_group_alignments(seq_groups, alignment_runner, args):
 
         try:
             alignment_runner.run(
-                fasta_path, alignment_dir
+                fasta_path, alignment_dir, seq
             )
         except Exception as e:
             logging.warning(e)
             logging.warning(f"Failed to run alignments for {first_name}. Skipping...")
             os.remove(fasta_path)
-            os.rmdir(alignment_dir)
+            shutil.rmtree(alignment_dir, ignore_errors=True)
+            errored_chains.append(f"{first_name}\t{e}")
             continue
 
         os.remove(fasta_path)
+        completed_chains.append(first_name)
 
         for name in names[1:]:
             if(name in dirs):
                 logging.warning(
                     f'{name} has already been processed. Skipping...'
                 )
+                skipped_chains.append(name)
                 continue
-            
+
             cp_dir = os.path.join(args.output_dir, name)
             os.makedirs(cp_dir, exist_ok=True)
-            
             for f in os.listdir(alignment_dir):
-                copyfile(os.path.join(alignment_dir, f), os.path.join(cp_dir, f))
+                shutil.copyfile(os.path.join(alignment_dir, f), os.path.join(cp_dir, f))
+            completed_chains.append(name)
 
 
-def parse_and_align(files, alignment_runner, args):
+def parse_and_align(files, alignment_runner, args,
+                    completed_chains, errored_chains,
+                    skipped_chains):
     for f in files:
         path = os.path.join(args.input_dir, f)
         file_id = os.path.splitext(f)[0]
@@ -111,7 +120,9 @@ def parse_and_align(files, alignment_runner, args):
             continue
 
         seq_group_tuples = [(k,v) for k,v in seq_group_dict.items()]
-        run_seq_group_alignments(seq_group_tuples, alignment_runner, args)
+        run_seq_group_alignments(seq_group_tuples, alignment_runner, args,
+                                completed_chains, errored_chains,
+                                skipped_chains)
 
 
 def main(args):
@@ -139,9 +150,11 @@ def main(args):
         uniref30_database_path=args.uniref30_database_path,
         uniclust30_database_path=args.uniclust30_database_path,
         uniprot_database_path=args.uniprot_database_path,
+        pmhc_templates_dir=args.pmhc_templates_dir,
         template_searcher=template_searcher,
-        use_small_bfd=args.bfd_database_path is None,
+        use_small_bfd=args.use_small_bfd,
         no_cpus=args.cpus_per_task,
+        use_pmhc_template_filter=args.use_pmhc_template_filter,
     )
 
     files = list(os.listdir(args.input_dir))
@@ -155,7 +168,7 @@ def main(args):
 
     dirs = []
     if(cache is not None and args.filter):
-        dirs = set(os.listdir(args.output_dir))
+        dirs = set(os.listdir(args.output_dir)) if os.path.isdir(args.output_dir) else set()
         def prot_is_done(f):
             prot_id = os.path.splitext(f)[0]
             if(prot_id in cache):
@@ -202,9 +215,15 @@ def main(args):
                         l = seq_group_dict.setdefault(seq, [])
                         l.append(chain_name)
        
-        func = partial(run_seq_group_alignments, 
-            alignment_runner=alignment_runner, 
-            args=args
+        completed_chains = []
+        errored_chains = []
+        skipped_chains = []
+        func = partial(run_seq_group_alignments,
+            alignment_runner=alignment_runner,
+            args=args,
+            completed_chains=completed_chains,
+            errored_chains=errored_chains,
+            skipped_chains=skipped_chains,
         )
 
         seq_groups = [(k,v) for k,v in seq_group_dict.items()]
@@ -214,9 +233,15 @@ def main(args):
 
         task_arglist = [[a] for a in split_up_arglist(seq_groups)]
     else:
+        completed_chains = []
+        errored_chains = []
+        skipped_chains = []
         func = partial(parse_and_align,
             alignment_runner=alignment_runner,
             args=args,
+            completed_chains=completed_chains,
+            errored_chains=errored_chains,
+            skipped_chains=skipped_chains,
         )
         task_arglist = [[a] for a in split_up_arglist(files)]
 
@@ -229,6 +254,17 @@ def main(args):
 
     for t in threads:
         t.join()
+
+    status = {
+        "completed": completed_chains,
+        "errored": errored_chains,
+        "skipped": skipped_chains,
+    }
+    with open(os.path.join(args.output_dir, ".status.json"), 'w') as f:
+        json.dump(status, f)
+    print(f"{len(completed_chains)} completed, "
+          f"{len(skipped_chains)} skipped (alignment dir already exists), "
+          f"{len(errored_chains)} errors")
 
 
 if __name__ == "__main__":
@@ -261,7 +297,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--filter", type=bool, default=True,
     )
-
+    parser.add_argument(
+        "--use_small_bfd", action="store_true", default=False,
+    )
+    parser.add_argument(
+        "--pmhc_templates_dir", type=str, default=None,
+        help="""Name of the directory containing pMHC /pdb and nr_cls_I_complexes.txt""",
+    )
+    parser.add_argument(
+        "--use_pmhc_template_filter", action="store_true", default=False,
+    )
     args = parser.parse_args()
 
     main(args)

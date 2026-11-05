@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by Adaptive Biotechnologies
 
 import random
 import torch
@@ -117,7 +118,17 @@ def ensembled_transform_fns(common_cfg, mode_cfg, ensemble_seed):
 def prepare_ground_truth_features(tensors):
     """Prepare ground truth features that are only needed for loss calculation during training"""
 
-    gt_features = ['all_atom_mask', 'all_atom_positions', 'asym_id', 'sym_id', 'entity_id']
+    gt_features = [
+        'all_atom_mask',
+        'all_atom_positions',
+        'asym_id',
+        'sym_id',
+        'entity_id',
+        "asym_id_tcra_tcrb_pep_mhc",
+        "binding_status",
+        "has_predicted_structure",
+        "has_true_structure",
+    ]
     gt_tensors = {k: v for k, v in tensors.items() if k in gt_features}
     gt_tensors['aatype'] = tensors['aatype'].to(torch.long)
     gt_tensors = compose(groundtruth_transforms_fns())(gt_tensors)

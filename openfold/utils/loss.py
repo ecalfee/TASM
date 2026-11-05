@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by Adaptive Biotechnologies
 
 import ml_collections
 import numpy as np
@@ -170,6 +171,7 @@ def backbone_loss(
     backbone_rigid_tensor: torch.Tensor,
     backbone_rigid_mask: torch.Tensor,
     traj: torch.Tensor,
+    structure_loss_positions_mask: torch.Tensor,
     pair_mask: Optional[torch.Tensor] = None,
     use_clamped_fape: Optional[torch.Tensor] = None,
     clamp_distance: float = 10.0,
@@ -197,12 +199,12 @@ def backbone_loss(
     gt_aff = Rigid.from_tensor_4x4(backbone_rigid_tensor)
 
     fape_loss = compute_fape(
-        pred_aff,
-        gt_aff[None],
-        backbone_rigid_mask[None],
-        pred_aff.get_trans(),
-        gt_aff[None].get_trans(),
-        backbone_rigid_mask[None],
+        pred_frames=pred_aff,
+        target_frames=gt_aff[None],
+        frames_mask=(backbone_rigid_mask*structure_loss_positions_mask)[None],
+        pred_positions=pred_aff.get_trans(),
+        target_positions=gt_aff[None].get_trans(),
+        positions_mask=(backbone_rigid_mask*structure_loss_positions_mask)[None],
         pair_mask=pair_mask,
         l1_clamp_distance=clamp_distance,
         length_scale=loss_unit_distance,
@@ -210,12 +212,12 @@ def backbone_loss(
     )
     if use_clamped_fape is not None:
         unclamped_fape_loss = compute_fape(
-            pred_aff,
-            gt_aff[None],
-            backbone_rigid_mask[None],
-            pred_aff.get_trans(),
-            gt_aff[None].get_trans(),
-            backbone_rigid_mask[None],
+            pred_frames=pred_aff,
+            target_frames=gt_aff[None],
+            frames_mask=(backbone_rigid_mask*structure_loss_positions_mask)[None],
+            pred_positions=pred_aff.get_trans(),
+            target_positions=gt_aff[None].get_trans(),
+            positions_mask=(backbone_rigid_mask*structure_loss_positions_mask)[None],
             pair_mask=pair_mask,
             l1_clamp_distance=None,
             length_scale=loss_unit_distance,
@@ -226,7 +228,8 @@ def backbone_loss(
             1 - use_clamped_fape
         )
 
-    # Average over the batch dimension
+    # Average over the batch dimension. Assumes batch size of 1.
+    # Will not work for any other size.
     fape_loss = torch.mean(fape_loss)
 
     return fape_loss
@@ -241,6 +244,7 @@ def sidechain_loss(
     renamed_atom14_gt_positions: torch.Tensor,
     renamed_atom14_gt_exists: torch.Tensor,
     alt_naming_is_better: torch.Tensor,
+    structure_loss_positions_mask: torch.Tensor,
     clamp_distance: float = 10.0,
     length_scale: float = 10.0,
     eps: float = 1e-4,
@@ -259,28 +263,41 @@ def sidechain_loss(
     sidechain_frames = Rigid.from_tensor_4x4(sidechain_frames)
     renamed_gt_frames = renamed_gt_frames.view(*batch_dims, -1, 4, 4)
     renamed_gt_frames = Rigid.from_tensor_4x4(renamed_gt_frames)
-    rigidgroups_gt_exists = rigidgroups_gt_exists.reshape(*batch_dims, -1)
+    
+    # zero out the full row of 8 rigid groups for any AA positions masked for the structure loss
+    # structure_loss_positions_mask has dim [N_structures, N_positions]
+    # rigidgroups_gt_exists has dim [N_structures, N_positions, 8]
+    rigidgroups_gt_exists_unmasked = structure_loss_positions_mask[..., None] * rigidgroups_gt_exists
+    # flatten to just [N_structures, N_positions * 8]
+    rigidgroups_gt_exists_unmasked = rigidgroups_gt_exists_unmasked.reshape(*batch_dims, -1)
     sidechain_atom_pos = sidechain_atom_pos[-1]
     sidechain_atom_pos = sidechain_atom_pos.view(*batch_dims, -1, 3)
     renamed_atom14_gt_positions = renamed_atom14_gt_positions.view(
         *batch_dims, -1, 3
     )
-    renamed_atom14_gt_exists = renamed_atom14_gt_exists.view(*batch_dims, -1)
+    # zero out the full row of 14 atoms for any AA positions masked for the structure loss
+    # structure_loss_positions_mask has dim [N_structures, N_positions]
+    # renamed_atom14_gt_exists has dim [N_structures, N_positions, 14]
+    renamed_atom14_gt_exists_unmasked = structure_loss_positions_mask[..., None] * renamed_atom14_gt_exists
+    renamed_atom14_gt_exists_unmasked = renamed_atom14_gt_exists_unmasked.view(*batch_dims, -1)
 
-    fape = compute_fape(
-        sidechain_frames,
-        renamed_gt_frames,
-        rigidgroups_gt_exists,
-        sidechain_atom_pos,
-        renamed_atom14_gt_positions,
-        renamed_atom14_gt_exists,
+    fape_loss = compute_fape(
+        pred_frames=sidechain_frames,
+        target_frames=renamed_gt_frames,
+        frames_mask=rigidgroups_gt_exists_unmasked,
+        pred_positions=sidechain_atom_pos,
+        target_positions=renamed_atom14_gt_positions,
+        positions_mask=renamed_atom14_gt_exists_unmasked,
         pair_mask=None,
         l1_clamp_distance=clamp_distance,
         length_scale=length_scale,
         eps=eps,
     )
+    
+    # Average over the batch dimension
+    fape_loss = torch.mean(fape_loss)
 
-    return fape
+    return fape_loss
 
 
 def fape_loss(
@@ -290,6 +307,7 @@ def fape_loss(
 ) -> torch.Tensor:
     traj = out["sm"]["frames"]
     asym_id = batch.get("asym_id")
+
     if asym_id is not None:
         intra_chain_mask = (asym_id[..., None] == asym_id[..., None, :]).to(dtype=traj.dtype)
         intra_chain_bb_loss = backbone_loss(
@@ -312,15 +330,12 @@ def fape_loss(
         weighted_bb_loss = bb_loss * config.backbone.weight
 
     sc_loss = sidechain_loss(
-        out["sm"]["sidechain_frames"],
-        out["sm"]["positions"],
+        sidechain_frames=out["sm"]["sidechain_frames"],
+        sidechain_atom_pos=out["sm"]["positions"],
         **{**batch, **config.sidechain},
     )
 
     loss = weighted_bb_loss + config.sidechain.weight * sc_loss
-
-    # Average over the batch dimension
-    loss = torch.mean(loss)
 
     return loss
 
@@ -332,6 +347,7 @@ def supervised_chi_loss(
     seq_mask: torch.Tensor,
     chi_mask: torch.Tensor,
     chi_angles_sin_cos: torch.Tensor,
+    structure_loss_positions_mask: torch.Tensor,
     chi_weight: float,
     angle_norm_weight: float,
     eps=1e-6,
@@ -353,6 +369,8 @@ def supervised_chi_loss(
                 [*, N, 7] angle mask
             chi_angles_sin_cos:
                 [*, N, 7, 2] ground truth angles
+            structure_loss_positions_mask:
+                [*, N_positions] positions mask; calculate loss only for these residues
             chi_weight:
                 Weight for the angle component of the loss
             angle_norm_weight:
@@ -360,19 +378,23 @@ def supervised_chi_loss(
         Returns:
             [*] loss tensor
     """
+    # apply positions mask to seq_mask and chi_mask
+    seq_mask = structure_loss_positions_mask * seq_mask
+    chi_mask = structure_loss_positions_mask[..., None] * chi_mask
+    
     pred_angles = angles_sin_cos[..., 3:, :]
     residue_type_one_hot = torch.nn.functional.one_hot(
         aatype,
         residue_constants.restype_num + 1,
     )
     chi_pi_periodic = torch.einsum(
-        "...ij,jk->ik",
+        "bij,jk->bik",
         residue_type_one_hot.type(angles_sin_cos.dtype),
         angles_sin_cos.new_tensor(residue_constants.chi_pi_periodic),
     )
 
     true_chi = chi_angles_sin_cos[None]
-
+    
     shifted_mask = (1 - 2 * chi_pi_periodic).unsqueeze(-1)
     true_chi_shifted = shifted_mask * true_chi
     sq_chi_error = torch.sum((true_chi - pred_angles) ** 2, dim=-1)
@@ -404,7 +426,7 @@ def supervised_chi_loss(
     )
 
     loss = loss + angle_norm_weight * angle_norm_loss
-
+    
     # Average over the batch dimension
     loss = torch.mean(loss)
 
@@ -509,6 +531,7 @@ def lddt_loss(
     all_atom_pred_pos: torch.Tensor,
     all_atom_positions: torch.Tensor,
     all_atom_mask: torch.Tensor,
+    structure_loss_positions_mask: torch.Tensor,
     resolution: torch.Tensor,
     cutoff: float = 15.0,
     no_bins: int = 50,
@@ -518,6 +541,9 @@ def lddt_loss(
     **kwargs,
 ) -> torch.Tensor:
     n = all_atom_mask.shape[-2]
+    
+    # For any position masked in the structure, set all atoms at that positions to zeros in the all atoms mask
+    all_atom_mask = structure_loss_positions_mask[..., None] * all_atom_mask
 
     ca_pos = residue_constants.atom_order["CA"]
     all_atom_pred_pos = all_atom_pred_pos[..., ca_pos, :]
@@ -563,12 +589,16 @@ def distogram_loss(
     logits,
     pseudo_beta,
     pseudo_beta_mask,
+    structure_loss_positions_mask: torch.Tensor,
     min_bin=2.3125,
     max_bin=21.6875,
     no_bins=64,
     eps=1e-6,
     **kwargs,
 ):
+    # add positions to mask to original pseudo beta mask
+    pseudo_beta_mask = structure_loss_positions_mask * pseudo_beta_mask
+    
     boundaries = torch.linspace(
         min_bin,
         max_bin,
@@ -600,11 +630,11 @@ def distogram_loss(
     mean = torch.sum(mean, dim=-1)
     mean = mean / denom[..., None]
     mean = torch.sum(mean, dim=-1)
+    
+    # Average over the batch dimension
+    loss = torch.mean(mean)
 
-    # Average over the batch dimensions
-    mean = torch.mean(mean)
-
-    return mean
+    return loss
 
 
 def _calculate_bin_centers(boundaries: torch.Tensor):
@@ -701,7 +731,12 @@ def compute_tm(
             assert len(asym_id.shape) <= 2
             batch_size = asym_id.shape[0]
             pair_mask = residue_weights.new_ones((batch_size, n, n), dtype=torch.int32)
-        pair_mask *= (asym_id[..., None] != asym_id[..., None, :]).to(dtype=pair_mask.dtype)
+        # pair_mask identifies all pairs of positions with different asym_id's (both A-B and B-A) 
+        # pair_mask was modified to exclude pairs where either position has zero as an id
+        pair_mask *= (
+            (asym_id[..., None] != asym_id[..., None, :])
+            & ((asym_id[..., None] * asym_id[..., None, :]) > 0)
+        ).to(dtype=pair_mask.dtype)
 
     predicted_tm_term *= pair_mask
 
@@ -723,6 +758,7 @@ def tm_loss(
     final_affine_tensor,
     backbone_rigid_tensor,
     backbone_rigid_mask,
+    structure_loss_positions_mask: torch.Tensor,
     resolution,
     max_bin=31,
     no_bins=64,
@@ -759,7 +795,7 @@ def tm_loss(
     )
 
     square_mask = (
-        backbone_rigid_mask[..., None] * backbone_rigid_mask[..., None, :]
+        (backbone_rigid_mask*structure_loss_positions_mask)[..., None] * (backbone_rigid_mask*structure_loss_positions_mask)[..., None, :]
     )
 
     loss = torch.sum(errors * square_mask, dim=-1)
@@ -777,7 +813,6 @@ def tm_loss(
     loss = torch.mean(loss)
 
     return loss
-
 
 def between_residue_bond_loss(
     pred_atom_positions: torch.Tensor,  # (*, N, 37/14, 3)
@@ -1459,6 +1494,34 @@ def violation_loss(
 
     return mean
 
+def classification_loss(
+        out: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor]
+    ):
+    """
+    Binary cross entropy loss with logits for predicted binding probability vs labelled binding status
+    Args:
+        out (Dict): openfold model output
+        batch (Dict): feature dictionary
+    Returns:
+        loss (torch.Tensor, size=[1]): binary cross entropy loss with logits
+    """
+    # if missing predicted log odds or ground truth, return nan
+    if "binding_logits" not in out or "binding_status" not in batch:
+        return torch.tensor(float("nan"))
+
+    # get predicted log odds of binding
+    predicted_logits = out["binding_logits"]
+    # if label is 1D tensor, convert to 2D to match tensor dimensions of predicted binding logits
+    # E.g., Tensor([1]) --> Tensor([[1]])
+    labels = batch["binding_status"]
+    if len(labels.shape) == 1:
+        labels = labels[:, None]
+
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(predicted_logits, labels)
+
+    return loss
+
 
 def compute_renamed_ground_truth(
     batch: Dict[str, torch.Tensor],
@@ -1578,6 +1641,9 @@ def experimentally_resolved_loss(
     eps: float = 1e-8,
     **kwargs,
 ) -> torch.Tensor:
+    """ penalizes incorrect predictions of whether atomic coordinates 
+    are resolved in experimental structures (Ahdritz et al 2024)
+    """
     errors = sigmoid_cross_entropy(logits, all_atom_mask)
     loss = torch.sum(errors * atom37_atom_exists, dim=-1)
     loss = loss / (eps + torch.sum(atom37_atom_exists, dim=(-1, -2)).unsqueeze(-1))
@@ -1586,7 +1652,8 @@ def experimentally_resolved_loss(
     loss = loss * (
         (resolution >= min_resolution) & (resolution <= max_resolution)
     )
-
+    
+    # Average over the batch dimension, applying relative weights for each structure in batch
     loss = torch.mean(loss)
 
     return loss
@@ -1632,7 +1699,8 @@ def chain_center_of_mass_loss(
     asym_id: torch.Tensor,
     clamp_distance: float = -4.0,
     weight: float = 0.05,
-    eps: float = 1e-10, **kwargs
+    eps: float = 1e-10, 
+    **kwargs
 ) -> torch.Tensor:
     """
     Computes chain centre-of-mass loss. Implements section 2.5, eqn 1 in the Multimer paper.
@@ -1676,11 +1744,39 @@ def chain_center_of_mass_loss(
     pred_dists = euclidean_distance(pred_centers[..., None, :], pred_centers[..., :, None], epsilon=eps)
     true_dists = euclidean_distance(true_centers[..., None, :], true_centers[..., :, None], epsilon=eps)
     losses = torch.clamp((weight * (pred_dists - true_dists - clamp_distance)), max=0) ** 2
-    loss_mask = chain_exists[..., :, None] * chain_exists[..., None, :]
+    loss_mask = chain_exists[..., :, None] * chain_exists[..., None, :] 
 
     loss = masked_mean(loss_mask, losses, dim=(-1, -2))
+
+    # Average over the batch dimension
+    loss = torch.mean(loss)
+    
     return loss
 
+def make_structure_loss_positions_mask(batch):
+    """
+    Resulting structure loss positions mask has dimenstions [N_structures, N_residues]
+    and is used in all losses for structural accuracy compared to ground truth
+    (but not structural losses for violations/clashes).
+    Positions mask is 1 for positions for which structure loss should be calculated, 0 otherwise.
+    """
+    '''
+    # if there is no asym_id_tcra_tcrb_pep_mhc, return all ones (aka no additional mask)
+    if "asym_id_tcra_tcrb_pep_mhc" not in batch.keys():
+        positions_mask = torch.ones_like(batch['seq_mask'])
+        logging.warning(f"No asym_id_tcra_tcrb_pep_mhc found in batch. Skipping MHC positions mask in structure loss ...")
+    # otherwise get MHC mask for structures with predicted ground-truth structures
+    else:
+        # mhc_loss_only saves whether to calculate loss on MHC only,  dimensions [N_structures]
+        mhc_loss_only = (batch['has_predicted_structure'] == 1)*(batch['has_true_structure'] == 0)
+        # MHC is chains 4 (& 5 for class II, not tested)
+        # is_mhc dimensions [N_structures, N_residues]
+        is_mhc = batch['asym_id_tcra_tcrb_pep_mhc'] >= 4
+        is_any_chain = torch.ones_like(batch['seq_mask'])
+        positions_mask = (mhc_loss_only[..., None] == 1)*is_mhc + (mhc_loss_only[..., None] == 0)*is_any_chain
+    '''
+    positions_mask = torch.ones_like(batch['seq_mask'])
+    return positions_mask
 
 class AlphaFoldLoss(nn.Module):
     """Aggregation of the various losses described in the supplement"""
@@ -1694,6 +1790,11 @@ class AlphaFoldLoss(nn.Module):
         Rename previous forward() as loss()
         so that can be reused in the subclass 
         """
+        # make a positions mask for the batch (MHC-only for predicted structures
+        # and all 1s for crystal structures) if positions mask doesn't already exist for this batch
+        if "structure_loss_positions_mask" not in batch.keys():
+            batch["structure_loss_positions_mask"] = make_structure_loss_positions_mask(batch)
+
         if "violation" not in out.keys():
             out["violation"] = find_structural_violations(
                 batch,
@@ -1719,9 +1820,9 @@ class AlphaFoldLoss(nn.Module):
                 **{**batch, **self.config.experimentally_resolved},
             ),
             "fape": lambda: fape_loss(
-                out,
-                batch,
-                self.config.fape,
+                out=out,
+                batch=batch,
+                config=self.config.fape,
             ),
             "plddt_loss": lambda: lddt_loss(
                 logits=out["lddt_logits"],
@@ -1733,14 +1834,18 @@ class AlphaFoldLoss(nn.Module):
                 **{**batch, **self.config.masked_msa},
             ),
             "supervised_chi": lambda: supervised_chi_loss(
-                out["sm"]["angles"],
-                out["sm"]["unnormalized_angles"],
+                angles_sin_cos = out["sm"]["angles"],
+                unnormalized_angles_sin_cos = out["sm"]["unnormalized_angles"],
                 **{**batch, **self.config.supervised_chi},
             ),
             "violation": lambda: violation_loss(
                 out["violation"],
                 **{**batch, **self.config.violation},
             ),
+            "classification": lambda: classification_loss(
+                out=out,
+                batch=batch,
+            )
         }
 
         if self.config.tm.enabled:
@@ -1759,7 +1864,24 @@ class AlphaFoldLoss(nn.Module):
         losses = {}
         for loss_name, loss_fn in loss_fns.items():
             weight = self.config[loss_name].weight
-            loss = loss_fn()
+            if batch["has_true_structure"] == 1:
+                weight = weight * self.config[loss_name].weight_crystal
+            else:
+                weight = weight * self.config[loss_name].weight_mira
+
+            # Skip structure loss computation if missing structure
+            if (
+                batch["has_predicted_structure"] == 0
+                and batch["has_true_structure"] == 0
+                and loss_name in [
+                    "distogram", "experimentally_resolved", "fape",
+                    "plddt_loss", "supervised_chi", "tm",
+                    "chain_center_of_mass"
+                ]
+            ):
+                loss = torch.tensor(0., device=batch["aatype"].device)
+            else:
+                loss = loss_fn()
             if torch.isnan(loss) or torch.isinf(loss):
                 # for k,v in batch.items():
                 #    if torch.any(torch.isnan(v)) or torch.any(torch.isinf(v)):

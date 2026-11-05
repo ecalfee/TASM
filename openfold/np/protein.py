@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by Adaptive Biotechnologies
 
 """Protein data type."""
 import dataclasses
@@ -266,6 +267,33 @@ def get_pdb_headers(prot: Protein, chain_id: int = 0) -> Sequence[str]:
     pdb_headers.append(f"PARENT {' '.join(parents)}")
 
     return pdb_headers
+
+
+def get_atom_coords(prot: Protein, chain_id: str):
+    """Get atom coordinates of a given chain.
+
+    Args:
+        prot (Protein): protein object containing entire strucute info
+        chain_id (str): Should be a letter e.g. "A"
+    Returns:
+        all_atom_positions (np array)
+        all_atom_mask (np array)
+    """
+    chain_id_mapping = {cid: n for n, cid in enumerate(string.ascii_uppercase)}
+    target_chain_index = chain_id_mapping[chain_id]
+
+    atom_positions_list = []
+    atom_mask_list = []
+
+    for i, ci in enumerate(prot.chain_index):
+        if ci == target_chain_index:
+            atom_positions_list.append(prot.atom_positions[i, :, :])
+            atom_mask_list.append(prot.atom_mask[i, :])
+
+    all_atom_positions = np.array(atom_positions_list)
+    all_atom_mask = np.array(atom_mask_list)
+
+    return all_atom_positions, all_atom_mask
 
 
 def add_pdb_headers(prot: Protein, pdb_str: str) -> str:
@@ -615,6 +643,12 @@ def from_prediction(
 
     if 'asym_id' in features:
         chain_index = _maybe_remove_leading_dim(features["asym_id"]) - 1
+    
+    # for tcr-pMHC complexes, use asym_id with separate ids for peptide and mhc
+    # to define 4 chains in the predicted structure (and output PDB file)
+    if 'asym_id_tcra_tcrb_pep_mhc' in features:
+        chain_index = _maybe_remove_leading_dim(features["asym_id_tcra_tcrb_pep_mhc"]) - 1
+    
     else:
         chain_index = np.zeros_like(
             _maybe_remove_leading_dim(features["aatype"])

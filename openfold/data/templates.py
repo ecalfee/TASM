@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by Adaptive Biotechnologies
 
 """Functions for getting templates and calculating template features."""
 import abc
@@ -1249,7 +1250,8 @@ class HmmsearchHitFeaturizer(TemplateHitFeaturizer):
                 release_dates = self._release_dates,
                 obsolete_pdbs = self._obsolete_pdbs,
                 strict_error_check = self._strict_error_check,
-                kalign_binary_path = self._kalign_binary_path
+                kalign_binary_path = self._kalign_binary_path,
+                _zero_center_positions = self._zero_center_positions
             )
 
             if result.error:

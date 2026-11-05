@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by Adaptive Biotechnologies
 
 """Restrained Amber Minimization of a structure."""
 
@@ -425,7 +426,7 @@ def _run_one_iteration(
       pdb_string: A pdb string.
       max_iterations: An `int` specifying the maximum number of L-BFGS iterations.
       A value of 0 specifies no limit.
-      tolerance: kcal/mol, the energy tolerance of L-BFGS.
+      tolerance: kcal/(mol * nm), the force tolerance of L-BFGS.
       stiffness: kcal/mol A**2, spring constant of heavy atom restraining
         potential.
       restraint_set: The set of atoms to restrain.
@@ -439,7 +440,7 @@ def _run_one_iteration(
     exclude_residues = exclude_residues or []
 
     # Assign physical dimensions.
-    tolerance = tolerance * ENERGY
+    tolerance = tolerance * ENERGY / unit.nanometer
     stiffness = stiffness * ENERGY / (LENGTH ** 2)
 
     start = time.perf_counter()
@@ -499,7 +500,7 @@ def run_pipeline(
           prior to every minimization.
       max_iterations: An `int` specifying the maximum number of L-BFGS steps
           per relax iteration. A value of 0 specifies no limit.
-      tolerance: kcal/mol, the energy tolerance of L-BFGS.
+      tolerance: kcal/(mol * nm), the force tolerance of L-BFGS.
           The default value is the OpenMM default.
       restraint_set: The set of atoms to restrain.
       max_attempts: The maximum number of minimization attempts per iteration.

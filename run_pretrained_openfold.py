@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by Adaptive Biotechnologies
 import argparse
 import logging
 import math
@@ -50,6 +51,7 @@ from openfold.utils.trace_utils import (
     pad_feature_dict_seq,
     trace_model_,
 )
+from openfold.utils.iplddt import calc_iplddt
 
 from scripts.precompute_embeddings import EmbeddingGenerator
 from scripts.utils import add_data_args
@@ -57,9 +59,22 @@ from scripts.utils import add_data_args
 
 TRACING_INTERVAL = 50
 
+def sigmoid(x):
+    return 1.0/(1.0 + np.exp(-x))
 
 def precompute_alignments(tags, seqs, alignment_dir, args):
-    for tag, seq in zip(tags, seqs):
+    # [alpha, beta, pmhc] --> [alpha, beta, pep, mhc, pep:mhc]
+    new_tags, new_seqs, = [], []
+    for t, s in zip(tags, seqs):
+        if ":" in s:
+            t1, t2 = t.split("z", 1)
+            s1, s2 = s.split(":")
+            new_tags.extend([t1, t2])
+            new_seqs.extend([s1, s2])
+        new_tags.append(t)
+        new_seqs.append(s)
+
+    for tag, seq in zip(new_tags, new_seqs):
         tmp_fasta_path = os.path.join(args.output_dir, f"tmp_{os.getpid()}.fasta")
         with open(tmp_fasta_path, "w") as fp:
             fp.write(f">{tag}\n{seq}")
@@ -84,10 +99,12 @@ def precompute_alignments(tags, seqs, alignment_dir, args):
                 )
 
             # In seqemb mode, use AlignmentRunner only to generate templates
+            # caution: single seq mode (soloseq) not fully tested for TCRmodel2 updates
             if args.use_single_seq_mode:
                 alignment_runner = data_pipeline.AlignmentRunner(
                     jackhmmer_binary_path=args.jackhmmer_binary_path,
                     uniref90_database_path=args.uniref90_database_path,
+                    pmhc_templates_dir=args.pmhc_templates_dir,
                     template_searcher=template_searcher,
                     no_cpus=args.cpus,
                 )
@@ -103,13 +120,15 @@ def precompute_alignments(tags, seqs, alignment_dir, args):
                     uniref30_database_path=args.uniref30_database_path,
                     uniclust30_database_path=args.uniclust30_database_path,
                     uniprot_database_path=args.uniprot_database_path,
+                    pmhc_templates_dir=args.pmhc_templates_dir,
                     template_searcher=template_searcher,
-                    use_small_bfd=args.bfd_database_path is None,
-                    no_cpus=args.cpus
+                    use_small_bfd=args.use_small_bfd,
+                    no_cpus=args.cpus,
+                    use_pmhc_template_filter=args.use_pmhc_template_filter,
                 )
 
             alignment_runner.run(
-                tmp_fasta_path, local_alignment_dir
+                tmp_fasta_path, local_alignment_dir, seq
             )
         else:
             logger.info(
@@ -130,17 +149,108 @@ def generate_feature_dict(
     alignment_dir,
     data_processor,
     args,
+    output_directory,
+    output_name,
 ):
     tmp_fasta_path = os.path.join(args.output_dir, f"tmp_{os.getpid()}.fasta")
 
+    # test for sequences with a : split (peptide:MHC)
+    has_pmhc = any([":" in seq for seq in seqs])
+
+    # where to save the template names
+    if args.save_template_names:
+        template_names_out_prefix = os.path.join(
+            output_directory, f"{output_name}_template_names"
+        )
+    else:
+        template_names_out_prefix = None
+
+    # original multimer features
     if "multimer" in args.config_preset:
         with open(tmp_fasta_path, "w") as fp:
             fp.write(
                 '\n'.join([f">{tag}\n{seq}" for tag, seq in zip(tags, seqs)])
             )
         feature_dict = data_processor.process_fasta(
-            fasta_path=tmp_fasta_path, alignment_dir=alignment_dir,
+            fasta_path=tmp_fasta_path,
+            alignment_dir=alignment_dir,
+            template_names_out_prefix=template_names_out_prefix
         )
+
+        # consolidate templates names from each chain into a json
+        if args.save_template_names:
+            # list of template name files
+            template_names_files = [
+                os.path.join(output_directory, x)
+                for x in os.listdir(output_directory)
+                if f"{output_name}_template_names" in x
+            ]
+
+            # make chain-to-template names dictionary
+            template_names_dict = {}
+            for fp in template_names_files:
+                chain_name = fp.split(".")[-2]
+                with open(fp, "r") as f:
+                    lines = f.readlines()
+                template_names = [x.rstrip() for x in lines]
+                template_names_dict[chain_name] = template_names
+                os.remove(fp)
+
+            with open(f"{template_names_out_prefix}.json", "w") as outfile:
+                json.dump(template_names_dict, outfile)
+
+        if has_pmhc:  # get MSA features from 4-piece fasta
+            # [alpha, beta, pmhc] --> [alpha, beta, pep, mhc]
+            new_tags, new_seqs, = [], []
+            for t, s in zip(tags, seqs):
+                if ":" in s:
+                    t1, t2 = t.split("z", 1)
+                    s1, s2 = s.split(":")
+                    new_tags.extend([t1, t2])
+                    new_seqs.extend([s1, s2])
+                else:
+                    new_tags.append(t)
+                    new_seqs.append(s)
+
+            # check that length of tags and length of seqs match
+            if (len(new_tags) != len(new_seqs)):
+                ValueError(
+                    "Tags and sequences in input fasta must match. If a "
+                    "sequence has a ':' then its tag must have a lowercase 'z', "
+                    "e.g. seq peptide:mhc has tag PEPNAMEzMHCNAME"
+                    )
+
+            # make peptide and mhc separate entries in the temporary fasta file
+            with open(tmp_fasta_path, "w") as fp:
+                fp.write(
+                    '\n'.join([f">{tag}\n{seq}" for tag, seq in zip(new_tags, new_seqs)])
+                )
+            feature_dict_four_piece = data_processor.process_fasta(
+                fasta_path=tmp_fasta_path, alignment_dir=alignment_dir,
+            )
+
+            # combine 3-part and 4-part feature dict
+            # these pieces come from the 4-part fasta:
+            # ['msa','deletion_matrix','cluster_bias_mask','bert_mask','msa_mask', 'num_alignments', 'deletion_mean']
+            # note: TCRmodel2 actually just uses dummy placeholders ([1] and [0,0,0...]) for num_alignments and deletion_mean
+            # but we take them from the 4-part features because they are derived from the # alignments in the msa 
+            # and the mean of each column in the deletion matrix (mean deletion for each amino acid positions)
+            for feature in [
+                "msa",
+                "deletion_matrix",
+                "cluster_bias_mask",
+                "bert_mask",
+                "msa_mask",
+                "num_alignments",
+                "deletion_mean",
+            ]:
+                feature_dict[feature] = feature_dict_four_piece[feature]
+            # asym_id keeps track of 3 pieces (tcra, tcrb, pmhc)
+            # and is used to calculate interface pTM between these 3 pieces (equivalent to ipTM from TCRmodel2)
+            # add an additional asym_id that keeps track of all 4 pieces (tcra, tcrb, pep, mhc)
+            # this is used in calculating extra interface pTM confidence scores (e.g. TCR-pMHC ipTM)
+            feature_dict["asym_id_tcra_tcrb_pep_mhc"] = feature_dict_four_piece["asym_id"]
+
     elif len(seqs) == 1:
         tag = tags[0]
         seq = seqs[0]
@@ -161,7 +271,7 @@ def generate_feature_dict(
         feature_dict = data_processor.process_multiseq_fasta(
             fasta_path=tmp_fasta_path, super_alignment_dir=alignment_dir,
         )
-
+    
     # Remove temporary FASTA file
     os.remove(tmp_fasta_path)
 
@@ -210,7 +320,8 @@ def main(args):
             max_hits=config.data.predict.max_templates,
             kalign_binary_path=args.kalign_binary_path,
             release_dates_path=args.release_dates_path,
-            obsolete_pdbs_path=args.obsolete_pdbs_path
+            obsolete_pdbs_path=args.obsolete_pdbs_path,
+            _zero_center_positions=not args.do_not_zero_center_positions  # TODO remove if no impact on final results
         )
     else:
         template_featurizer = templates.HhsearchHitFeaturizer(
@@ -224,6 +335,7 @@ def main(args):
 
     data_processor = data_pipeline.DataPipeline(
         template_featurizer=template_featurizer,
+        pmhc_templates_dir=args.pmhc_templates_dir,
     )
 
     if is_multimer:
@@ -274,9 +386,9 @@ def main(args):
     sorted_targets = sorted(zip(tag_list, seq_list), key=seq_sort_fn)
     feature_dicts = {}
 
-    if is_multimer and args.openfold_checkpoint_path:
-        raise ValueError(
-            '`openfold_checkpoint_path` was specified, but no OpenFold checkpoints are available for multimer mode')
+    #if is_multimer and args.openfold_checkpoint_path:
+    #    raise ValueError(
+    #        '`openfold_checkpoint_path` was specified, but no OpenFold checkpoints are available for multimer mode')
 
     model_generator = load_models_from_command_line(
         config,
@@ -285,105 +397,180 @@ def main(args):
         args.jax_param_path,
         args.output_dir)
 
+    log_dir = os.path.join(args.output_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    completed_path = os.path.join(log_dir, "completed.log")
+    errored_path = os.path.join(log_dir, "errors.log")
+    n_completed = 0
+    n_errored = 0
+
     for model, output_directory in model_generator:
         cur_tracing_interval = 0
         for (tag, tags), seqs in sorted_targets:
-            output_name = f'{tag}_{args.config_preset}'
-            if args.output_postfix is not None:
-                output_name = f'{output_name}_{args.output_postfix}'
+            try:
+                output_name = f'{tag}_{args.config_preset}'
+                if args.output_postfix is not None:
+                    output_name = f'{output_name}_{args.output_postfix}'
 
-            # Does nothing if the alignments have already been computed
-            precompute_alignments(tags, seqs, alignment_dir, args)
+                # Does nothing if the alignments have already been computed
+                precompute_alignments(tags, seqs, alignment_dir, args)
 
-            feature_dict = feature_dicts.get(tag, None)
-            if feature_dict is None:
-                feature_dict = generate_feature_dict(
-                    tags,
-                    seqs,
-                    alignment_dir,
-                    data_processor,
-                    args,
+                feature_dict = feature_dicts.get(tag, None)
+                if feature_dict is None:
+                    feature_dict = generate_feature_dict(
+                        tags,
+                        seqs,
+                        alignment_dir,
+                        data_processor,
+                        args,
+                        output_directory,
+                        output_name,
+                    )
+
+                    if args.trace_model:
+                        n = feature_dict["aatype"].shape[-2]
+                        rounded_seqlen = round_up_seqlen(n)
+                        feature_dict = pad_feature_dict_seq(
+                            feature_dict, rounded_seqlen,
+                        )
+
+                    feature_dicts[tag] = feature_dict
+
+                if args.save_features:
+                    features_output_path = os.path.join(
+                        output_directory, f'{output_name}_feature_dict.pkl'
+                    )
+                    with open(features_output_path, 'wb') as f:
+                        pickle.dump(feature_dict, f, protocol=4)
+                    logger.info(f"Feature dict written to {features_output_path}...")
+                if args.generate_features_only:
+                    continue
+
+                processed_feature_dict = feature_processor.process_features(
+                    feature_dict, mode='predict', is_multimer=is_multimer
                 )
+
+                processed_feature_dict = {
+                    k: torch.as_tensor(v, device=args.model_device)
+                    for k, v in processed_feature_dict.items()
+                }
 
                 if args.trace_model:
-                    n = feature_dict["aatype"].shape[-2]
-                    rounded_seqlen = round_up_seqlen(n)
-                    feature_dict = pad_feature_dict_seq(
-                        feature_dict, rounded_seqlen,
-                    )
+                    if rounded_seqlen > cur_tracing_interval:
+                        logger.info(
+                            f"Tracing model at {rounded_seqlen} residues..."
+                        )
+                        t = time.perf_counter()
+                        trace_model_(model, processed_feature_dict)
+                        tracing_time = time.perf_counter() - t
+                        logger.info(
+                            f"Tracing time: {tracing_time}"
+                        )
+                        cur_tracing_interval = rounded_seqlen
 
-                feature_dicts[tag] = feature_dict
+                out = run_model(model, processed_feature_dict, tag, args.output_dir)
 
-            processed_feature_dict = feature_processor.process_features(
-                feature_dict, mode='predict', is_multimer=is_multimer
-            )
-
-            processed_feature_dict = {
-                k: torch.as_tensor(v, device=args.model_device)
-                for k, v in processed_feature_dict.items()
-            }
-
-            if args.trace_model:
-                if rounded_seqlen > cur_tracing_interval:
-                    logger.info(
-                        f"Tracing model at {rounded_seqlen} residues..."
-                    )
-                    t = time.perf_counter()
-                    trace_model_(model, processed_feature_dict)
-                    tracing_time = time.perf_counter() - t
-                    logger.info(
-                        f"Tracing time: {tracing_time}"
-                    )
-                    cur_tracing_interval = rounded_seqlen
-
-            out = run_model(model, processed_feature_dict, tag, args.output_dir)
-
-            # Toss out the recycling dimensions --- we don't need them anymore
-            processed_feature_dict = tensor_tree_map(
-                lambda x: np.array(x[..., -1].cpu()),
-                processed_feature_dict
-            )
-            out = tensor_tree_map(lambda x: np.array(x.cpu()), out)
-
-            unrelaxed_protein = prep_output(
-                out,
-                processed_feature_dict,
-                feature_dict,
-                feature_processor,
-                args.config_preset,
-                args.multimer_ri_gap,
-                args.subtract_plddt
-            )
-
-            unrelaxed_file_suffix = "_unrelaxed.pdb"
-            if args.cif_output:
-                unrelaxed_file_suffix = "_unrelaxed.cif"
-            unrelaxed_output_path = os.path.join(
-                output_directory, f'{output_name}{unrelaxed_file_suffix}'
-            )
-
-            with open(unrelaxed_output_path, 'w') as fp:
-                if args.cif_output:
-                    fp.write(protein.to_modelcif(unrelaxed_protein))
-                else:
-                    fp.write(protein.to_pdb(unrelaxed_protein))
-
-            logger.info(f"Output written to {unrelaxed_output_path}...")
-
-            if not args.skip_relaxation:
-                # Relax the prediction.
-                logger.info(f"Running relaxation on {unrelaxed_output_path}...")
-                relax_protein(config, args.model_device, unrelaxed_protein, output_directory, output_name,
-                              args.cif_output)
-
-            if args.save_outputs:
-                output_dict_path = os.path.join(
-                    output_directory, f'{output_name}_output_dict.pkl'
+                # Toss out the recycling dimensions --- we don't need them anymore
+                processed_feature_dict = tensor_tree_map(
+                    lambda x: np.array(x[..., -1].cpu()),
+                    processed_feature_dict
                 )
-                with open(output_dict_path, "wb") as fp:
-                    pickle.dump(out, fp, protocol=pickle.HIGHEST_PROTOCOL)
+                out = tensor_tree_map(lambda x: np.array(x.cpu()), out)
 
-                logger.info(f"Model output written to {output_dict_path}...")
+                unrelaxed_protein = prep_output(
+                    out,
+                    processed_feature_dict,
+                    feature_dict,
+                    feature_processor,
+                    args.config_preset,
+                    args.multimer_ri_gap,
+                    args.subtract_plddt
+                )
+
+                unrelaxed_file_suffix = "_unrelaxed.pdb"
+                if args.cif_output:
+                    unrelaxed_file_suffix = "_unrelaxed.cif"
+                unrelaxed_output_path = os.path.join(
+                    output_directory, f'{output_name}{unrelaxed_file_suffix}'
+                )
+
+                with open(unrelaxed_output_path, 'w') as fp:
+                    if args.cif_output:
+                        fp.write(protein.to_modelcif(unrelaxed_protein))
+                    else:
+                        fp.write(protein.to_pdb(unrelaxed_protein))
+
+                logger.info(f"Output written to {unrelaxed_output_path}...")
+
+                if not args.skip_relaxation:
+                    # Relax the prediction.
+                    logger.info(f"Running relaxation on {unrelaxed_output_path}...")
+                    relax_protein(config, args.model_device, unrelaxed_protein, output_directory, output_name,
+                                  args.cif_output)
+
+                # calculate TCR-pMHC interface pLDDT from .pdb output (if pdb available and structure is multimer)
+                if is_multimer:
+                    if args.cif_output:
+                        logger.info(
+                            f"Skipping iPLDDT and n_interacting_positions. These stats are only available for .pdb predicted structures and you have selected --cif_output"
+                        )
+                    else:
+                        tcr_pmhc_iplddt, count_residues_tcr_pmhc_interface = calc_iplddt(
+                            unrelaxed_output_path
+                        )
+                        out["tcr_pmhc_iplddt_score"] = tcr_pmhc_iplddt
+                        out["count_residues_tcr_pmhc_interface"] = count_residues_tcr_pmhc_interface
+                    # apply sigmoid to translate log odds into a probability, then convert array to scalar
+                    out["binding_prob"] = sigmoid(out["binding_logits"][0][0])
+                    out["binding_logits"] = out["binding_logits"][0][0]
+
+                if args.save_outputs:
+                    output_dict_path = os.path.join(
+                        output_directory, f'{output_name}_output_dict.pkl'
+                    )
+                    with open(output_dict_path, "wb") as fp:
+                        pickle.dump(out, fp, protocol=pickle.HIGHEST_PROTOCOL)
+
+                    logger.info(f"Model output written to {output_dict_path}...")
+
+                # save text file with model confidence scores (ipTM, iplddt etc.)
+                scores_list = [
+                    "binding_logits",
+                    "binding_prob",
+                    "ptm_score",
+                    "iptm_score",
+                    "weighted_ptm_score",
+                    "iptm_tcr_pmhc_score",
+                    "iptm_tcr_peptide_score",
+                    "iptm_tcr_mhc_score",
+                    "iptm_peptide_mhc_score",
+                ]
+                if not args.cif_output:  # some scores only available from .pdb outputs
+                    scores_list.extend(
+                        ["tcr_pmhc_iplddt_score", "count_residues_tcr_pmhc_interface"]
+                    )
+                # write file
+                output_scores_path = os.path.join(
+                    output_directory, f"{output_name}_model_confidence_scores.tsv"
+                )
+                with open(output_scores_path, "w") as f:
+                    f.write("%s\t%s\n" % ("score", "value"))
+                    for score in scores_list:
+                        f.write("%s\t%s\n" % (score, out[score]))
+                logger.info(f"Model confidence scores written to {output_scores_path}...")
+
+                with open(completed_path, 'a') as f:
+                    f.write(tag + '\n')
+                n_completed += 1
+            except Exception as e:
+                logger.error(f"Failed on structure {tag}: {e}")
+                with open(errored_path, 'a') as f:
+                    f.write(f"{tag}\t{e}\n")
+                n_errored += 1
+
+    with open(os.path.join(log_dir, "done.log"), 'w') as f:
+        f.write(f"completed {n_completed} structures, {n_errored} errors\n")
+    logger.info(f"Completed {n_completed} structures, {n_errored} errors.")
 
 
 if __name__ == "__main__":
@@ -479,6 +666,28 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_deepspeed_evoformer_attention", action="store_true", default=False, 
         help="Whether to use the DeepSpeed evoformer attention layer. Must have deepspeed installed in the environment.",
+    )
+    parser.add_argument(
+        "--save_features", action="store_true", default=False,
+    )
+    parser.add_argument(
+        "--generate_features_only", action="store_true", default=False,
+    )
+    parser.add_argument(
+        "--use_small_bfd", action="store_true", default=False,
+    )
+    parser.add_argument(
+        "--pmhc_templates_dir", type=str, default=None,
+        help="""Name of the directory containing pMHC /pdb and nr_cls_I_complexes.txt""",
+    )
+    parser.add_argument(
+        "--do_not_zero_center_positions", action="store_true", default=False,
+    )
+    parser.add_argument(
+        "--use_pmhc_template_filter", action="store_true", default=False,
+    )
+    parser.add_argument(
+        "--save_template_names", action="store_true", default=False,
     )
     add_data_args(parser)
     args = parser.parse_args()
