@@ -1,0 +1,32 @@
+**/.pixi/envs/
+**/.pixi/solve-group-envs/
+**/.pixi/target/
+!openfold-habitats/.pixi/config.toml
+**/.tmp
+**/.env
+**/.envrc
+**/__pycache__/
+**/.git
+.claude/
+
+# Temporary files
+**/*.tmp
+**/*.temp
+**/*.log
+logs/
+
+# Large data and checkpoint files
+**/*.tar
+**/*.h5
+**/*.hdf5
+**/*.pkl
+**/*.pickle
+**/*.npz
+**/*.npy
+**/*.ckpt
+**/*.pth
+**/*.pt
+**/*.pdf
+
+# Compiled CUDA kernels
+**/attn_core_inplace_cuda.*.so

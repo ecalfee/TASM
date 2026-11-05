@@ -1,3 +1,4 @@
+# Modified by Adaptive Biotechnologies
 import json
 import logging
 import os
@@ -81,7 +82,7 @@ def load_models_from_command_line(config, model_device, openfold_checkpoint_path
             if os.path.isdir(path):
                 # A DeepSpeed checkpoint
                 ckpt_path = os.path.join(
-                    output_dir,
+                    path,
                     checkpoint_basename + ".pt",
                 )
 
@@ -204,17 +205,31 @@ def prep_output(out, batch, feature_dict, feature_processor, config_preset, mult
     ])
 
     # For multi-chain FASTAs
-    ri = feature_dict["residue_index"]
-    chain_index = (ri - numpy.arange(ri.shape[0])) / multimer_ri_gap
-    chain_index = chain_index.astype(numpy.int64)
-    cur_chain = 0
-    prev_chain_max = 0
-    for i, c in enumerate(chain_index):
-        if c != cur_chain:
-            cur_chain = c
-            prev_chain_max = i + cur_chain * multimer_ri_gap
+    # re-number residues to start with 0 at the beginning of each chain
+    if "asym_id_tcra_tcrb_pep_mhc" in feature_dict: # both peptide and MHC should start residue index with zero
+        chain_index = feature_dict["asym_id_tcra_tcrb_pep_mhc"].copy() # get chain IDs that separate tcra, tcrb, peptide and mhc
+        subchain_index = numpy.zeros_like(chain_index)
+        new_residue_index = numpy.zeros_like(chain_index)
+        # count the number of residues in each unique chain
+        unique_chains, residues_in_chain = numpy.unique(chain_index, return_counts = True)
+        for i,x in enumerate(unique_chains):
+            # for each chain, replace the residues with that chain index with an array 0,1,2.. up to length of chain
+            new_residue_index[chain_index == x] = range(residues_in_chain[i])
+        batch["residue_index"] = new_residue_index
+    else: # original openfold code to handle multi-chain fasta files being treated as monomers
+        # this code section detects gaps that indicate a new chain
+        # assumes all residue indexes are continuous except for added gaps (e.g. 200bp linkers)
+        ri = feature_dict["residue_index"]
+        chain_index = (ri - numpy.arange(ri.shape[0])) / multimer_ri_gap
+        chain_index = chain_index.astype(numpy.int64)
+        cur_chain = 0
+        prev_chain_max = 0
+        for i, c in enumerate(chain_index):
+            if c != cur_chain:
+                cur_chain = c
+                prev_chain_max = i + cur_chain * multimer_ri_gap
 
-        batch["residue_index"][i] -= prev_chain_max
+            batch["residue_index"][i] -= prev_chain_max
 
     unrelaxed_protein = protein.from_prediction(
         features=batch,

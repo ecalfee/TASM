@@ -12,9 +12,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+# Modified by Adaptive Biotechnologies
 
 import torch
 import torch.nn as nn
+import numpy as np
 
 from openfold.model.primitives import Linear, LayerNorm
 from openfold.utils.loss import (
@@ -80,12 +82,64 @@ class AuxiliaryHeads(nn.Module):
                 tm_logits, **self.config.tm
             )
             asym_id = outputs.get("asym_id")
+            asym_id_tcra_tcrb_pep_mhc = outputs.get("asym_id_tcra_tcrb_pep_mhc")
+
             if asym_id is not None:
                 aux_out["iptm_score"] = compute_tm(
                     tm_logits, asym_id=asym_id, interface=True, **self.config.tm
                 )
                 aux_out["weighted_ptm_score"] = (self.config.tm["iptm_weight"] * aux_out["iptm_score"]
                                                  + self.config.tm["ptm_weight"] * aux_out["ptm_score"])
+
+            # add tcr-pmhc interface confidence scores
+            # compute_tm() computes a TM score for all interfaces between
+            # positions with different (but both non-zero) asym_id's
+            if asym_id_tcra_tcrb_pep_mhc is not None:
+                # print("Calculating ipTM TCR-pMHC score")
+                # convert 1,2 (tcra,tcrb) to feature 1 and 3,4 (peptide,mhc) to feature 2
+                asym_id_tcr_pmhc = torch.where(asym_id_tcra_tcrb_pep_mhc <= 2, 1, 2)
+                aux_out["iptm_tcr_pmhc_score"] = compute_tm(
+                    tm_logits,
+                    asym_id=asym_id_tcr_pmhc,
+                    interface=True,
+                    **self.config.tm,
+                )
+                # convert 1,2 (tcra,tcrb) to feature 1; 3 (peptide) to feature 2; and 4 (mhc) to feature 0
+                asym_id_tcr_peptide = torch.where(
+                    asym_id_tcra_tcrb_pep_mhc <= 2,
+                    1,
+                    torch.where(asym_id_tcra_tcrb_pep_mhc == 3, 2, 0),
+                )
+                aux_out["iptm_tcr_peptide_score"] = compute_tm(
+                    tm_logits,
+                    asym_id=asym_id_tcr_peptide,
+                    interface=True,
+                    **self.config.tm,
+                )
+                # convert 1,2 (tcra,tcrb) to feature 1; 4 (mhc) to feature 2; and 3 (peptide) to feature 0
+                asym_id_tcr_mhc = torch.where(
+                    asym_id_tcra_tcrb_pep_mhc <= 2,
+                    1,
+                    torch.where(asym_id_tcra_tcrb_pep_mhc >= 4, 2, 0),
+                )
+                aux_out["iptm_tcr_mhc_score"] = compute_tm(
+                    tm_logits, 
+                    asym_id=asym_id_tcr_mhc, 
+                    interface=True, 
+                    **self.config.tm
+                )
+                # convert 1,2 (tcra,tcrb) to feature 0; 3 (peptide) to feature 1; and 4 (mhc) to feature 2
+                asym_id_peptide_mhc = torch.where(
+                    asym_id_tcra_tcrb_pep_mhc <= 2,
+                    0,
+                    torch.where(asym_id_tcra_tcrb_pep_mhc == 3, 1, 2),
+                )
+                aux_out["iptm_peptide_mhc_score"] = compute_tm(
+                    tm_logits,
+                    asym_id=asym_id_peptide_mhc,
+                    interface=True,
+                    **self.config.tm,
+                )
 
             aux_out.update(
                 compute_predicted_aligned_error(

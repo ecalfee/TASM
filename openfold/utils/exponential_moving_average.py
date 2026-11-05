@@ -1,3 +1,4 @@
+# Modified by Adaptive Biotechnologies
 from collections import OrderedDict
 import copy
 import torch
@@ -69,3 +70,13 @@ class ExponentialMovingAverage:
                 "decay": self.decay,
             }
         )
+    
+    def reinit_params(self, model: torch.nn.Module) -> None:
+        """
+        Re-initialize parameters after model weights are imported.
+        Used when EMA parameters are initialized before pretrained model
+        weights are imported (which is the case in train_openfold.py).
+        """
+        state_dict = model.state_dict()
+        for k in state_dict.keys():
+            self.params[k] = state_dict[k].clone()

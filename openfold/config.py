@@ -1,3 +1,4 @@
+# Modified by Adaptive Biotechnologies
 import re
 import copy
 import importlib
@@ -456,7 +457,7 @@ config = mlc.ConfigDict(
                 "use_small_bfd": False,
                 "data_loaders": {
                     "batch_size": 1,
-                    "num_workers": 16,
+                    "num_workers": 12,
                     "pin_memory": True,
                 },
             },
@@ -467,7 +468,7 @@ config = mlc.ConfigDict(
             "chunk_size": chunk_size,
             # Use DeepSpeed memory-efficient attention kernel. Mutually
             # exclusive with use_lma and use_flash.
-            "use_deepspeed_evo_attention": False,
+            "use_deepspeed_evo_attention": True,
             # Use Staats & Rabe's low-memory attention algorithm. Mutually
             # exclusive with use_deepspeed_evo_attention and use_flash.
             "use_lma": False,
@@ -656,7 +657,8 @@ config = mlc.ConfigDict(
             # iterations. A positive value will enable early stopping if the
             # difference in pairwise distances is less than the tolerance between
             # recycling steps.
-            "recycle_early_stop_tolerance": -1.
+            "recycle_early_stop_tolerance": -1.,
+            "freeze_trunk": False,
         },
         "relax": {
             "max_iterations": 0,  # no max
@@ -666,18 +668,24 @@ config = mlc.ConfigDict(
             "exclude_residues": [],
         },
         "loss": {
+            # each loss is weighted by (weight * weight_mira) for MIRA
+            # and (weight * weight_crystal) for crystal structures
             "distogram": {
                 "min_bin": 2.3125,
                 "max_bin": 21.6875,
                 "no_bins": 64,
                 "eps": eps,  # 1e-6,
                 "weight": 0.3,
+                "weight_mira": 0.0,
+                "weight_crystal": 1.0,
             },
             "experimentally_resolved": {
                 "eps": eps,  # 1e-8,
                 "min_resolution": 0.1,
                 "max_resolution": 3.0,
                 "weight": 0.0,
+                "weight_mira": 0.0,
+                "weight_crystal": 1.0,
             },
             "fape": {
                 "backbone": {
@@ -692,6 +700,8 @@ config = mlc.ConfigDict(
                 },
                 "eps": 1e-4,
                 "weight": 1.0,
+                "weight_mira": 0.0,
+                "weight_crystal": 1.0,
             },
             "plddt_loss": {
                 "min_resolution": 0.1,
@@ -700,24 +710,32 @@ config = mlc.ConfigDict(
                 "no_bins": 50,
                 "eps": eps,  # 1e-10,
                 "weight": 0.01,
+                "weight_mira": 0.0,
+                "weight_crystal": 1.0,
             },
             "masked_msa": {
                 "num_classes": 23,
                 "eps": eps,  # 1e-8,
-                "weight": 2.0,
+                "weight": 0.2,
+                "weight_mira": 1.0,
+                "weight_crystal": 1.0,
             },
             "supervised_chi": {
                 "chi_weight": 0.5,
                 "angle_norm_weight": 0.01,
                 "eps": eps,  # 1e-6,
                 "weight": 1.0,
+                "weight_mira": 0.0,
+                "weight_crystal": 1.0,
             },
             "violation": {
                 "violation_tolerance_factor": 12.0,
                 "clash_overlap_tolerance": 1.5,
                 "average_clashes": False,
                 "eps": eps,  # 1e-6,
-                "weight": 0.0,
+                "weight": 0.03,
+                "weight_mira": 1.0,
+                "weight_crystal": 1.0,
             },
             "tm": {
                 "max_bin": 31,
@@ -725,7 +743,9 @@ config = mlc.ConfigDict(
                 "min_resolution": 0.1,
                 "max_resolution": 3.0,
                 "eps": eps,  # 1e-8,
-                "weight": 0.,
+                "weight": 0.01,
+                "weight_mira": 0.0,
+                "weight_crystal": 1.0,
                 "enabled": tm_enabled,
             },
             "chain_center_of_mass": {
@@ -737,6 +757,11 @@ config = mlc.ConfigDict(
             "eps": eps,
         },
         "ema": {"decay": 0.999},
+        "lr_schedule": {
+            "max_lr": 0.0001,
+            "warmup_no_steps": 0,
+            "start_decay_after_n_steps": 50000,
+        }
     }
 )
 
@@ -756,9 +781,11 @@ multimer_config_update = mlc.ConfigDict({
                 # "all_crops_all_chains_residue_ids": [],
                 "assembly_num_chains": [],
                 "asym_id": [NUM_RES],
+                "asym_id_tcra_tcrb_pep_mhc": [NUM_RES],
                 "atom14_atom_exists": [NUM_RES, None],
                 "atom37_atom_exists": [NUM_RES, None],
                 "bert_mask": [NUM_MSA_SEQ, NUM_RES],
+                "binding_status": [],  # MIRA training
                 "cluster_bias_mask": [NUM_MSA_SEQ],
                 "cluster_profile": [NUM_MSA_SEQ, NUM_RES, None],
                 "cluster_deletion_mean": [NUM_MSA_SEQ, NUM_RES],
@@ -769,6 +796,9 @@ multimer_config_update = mlc.ConfigDict({
                 "extra_deletion_matrix": [NUM_EXTRA_SEQ, NUM_RES],
                 "extra_msa": [NUM_EXTRA_SEQ, NUM_RES],
                 "extra_msa_mask": [NUM_EXTRA_SEQ, NUM_RES],
+                "has_true_structure": [],  # MIRA training
+                "has_predicted_structure": [],  # MIRA training
+                "sample_index": [],  # multi-allele MIRA training
                 # "mem_peak": [],
                 "msa": [NUM_MSA_SEQ, NUM_RES],
                 "msa_feat": [NUM_MSA_SEQ, NUM_RES, None],
@@ -806,8 +836,13 @@ multimer_config_update = mlc.ConfigDict({
                     "msa_mask",
                     "seq_mask",
                     "asym_id",
+                    "asym_id_tcra_tcrb_pep_mhc", # TCRmodel2 update
                     "entity_id",
                     "sym_id",
+                    "binding_status",  # MIRA training
+                    "has_true_structure",  # MIRA training
+                    "has_predicted_structure",  # MIRA training
+                    "sample_index",  # multi-allele MIRA training
                 ]
         },
         "supervised": {
@@ -828,7 +863,7 @@ multimer_config_update = mlc.ConfigDict({
             "max_msa_clusters": 508,
             "max_extra_msa": 2048,
             "block_delete_msa" : False,
-            "crop_size": 640,
+            "crop_size": 384,
             "spatial_crop_prob": 0.5,
             "interface_threshold": 10.,
             "clamp_prob": 1.,
@@ -887,9 +922,20 @@ multimer_config_update = mlc.ConfigDict({
                 "c_out": 22
             },
         },
-        "recycle_early_stop_tolerance": 0.5  # For training, value is -1.
+        "recycle_early_stop_tolerance": 0.5,  # For training, value is -1.
+        "classifier": {
+            "use_classifier": True,
+            "freeze_params": False,
+            "beta0": -.87,
+            "beta1": 1.52,
+        },
     },
     "loss": {
+        "classification": {
+            "weight": 6.0,
+            "weight_mira": 1.0,
+            "weight_crystal": 0.0,
+        },
         "fape": {
             "intra_chain_backbone": {
                 "clamp_distance": 10.0,
@@ -910,11 +956,13 @@ multimer_config_update = mlc.ConfigDict({
             "weight": 0.03 # Not finetuning
         },
         "tm": {
-            "weight": 0.1,
+            "weight": 0.01,
             "enabled": True
         },
         "chain_center_of_mass": {
             "weight": 0.05,
+            "weight_mira": 0.0,
+            "weight_crystal": 1.0,
             "enabled": True
         }
     }
